@@ -43,8 +43,34 @@ def init_schema(c):
     ''')
     if 'preview_options' not in {r['name'] for r in c.execute('PRAGMA table_info(gmail_intake)')}:
         c.execute('ALTER TABLE gmail_intake ADD COLUMN preview_options TEXT')
+    if 'auto_suppressed' not in {r['name'] for r in c.execute('PRAGMA table_info(gmail_intake)')}:
+        c.execute('ALTER TABLE gmail_intake ADD COLUMN auto_suppressed INTEGER NOT NULL DEFAULT 0')
+    c.execute('''CREATE TABLE IF NOT EXISTS email_account_links (
+        issuer TEXT NOT NULL, account_type TEXT NOT NULL, last4 TEXT NOT NULL,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        PRIMARY KEY(issuer,account_type,last4))''')
     if 'all_senders' not in {r['name'] for r in c.execute('PRAGMA table_info(gmail_settings)')}:
         c.execute('ALTER TABLE gmail_settings ADD COLUMN all_senders INTEGER NOT NULL DEFAULT 0')
+    c.execute('''CREATE TABLE IF NOT EXISTS gmail_statement_rules (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL, sender TEXT NOT NULL,
+        subject_keyword TEXT NOT NULL, filename_keyword TEXT NOT NULL,
+        account_id INTEGER NOT NULL REFERENCES accounts(id),
+        password_account_id INTEGER REFERENCES accounts(id))''')
+
+
+def statement_route(c, item):
+    if item['status']!='pending' or not item['filename'].lower().endswith('.pdf'):
+        return None
+    matches=[]
+    for row in c.execute('''SELECT r.*,a.name account_name,p.name password_account_name
+        FROM gmail_statement_rules r JOIN accounts a ON a.id=r.account_id
+        LEFT JOIN accounts p ON p.id=r.password_account_id
+        WHERE a.archived=0 AND (p.id IS NULL OR p.archived=0)'''):
+        r=dict(row)
+        if (item['sender'].lower()==r['sender'] and r['subject_keyword'] in item['subject'].lower()
+                and r['filename_keyword'] in item['filename'].lower()): matches.append(r)
+    if len(matches)>1: return {'ambiguous':True,'note':'Several statement rules match. Choose the account/password manually or narrow the rules.'}
+    return matches[0] if matches else None
 
 
 def sender_filter(s):
@@ -153,15 +179,18 @@ def classify(payload, allowed):
     combined=subject+' '+plain
     # Conservative classification only: alerts never become posted transactions.
     financial = bool(re.search(r'\b(debited|credited|spent|transaction|statement|payment received|refund)\b', combined, re.I))
+    # Explicit enabled definitions may recognize wording outside the built-in keywords.
+    import custom_parsers
+    financial = financial or any(d['kind']=='email' and d['sender'].lower()==sender and d['contains'].lower() in plain.lower() for d in custom_parsers.enabled(ledger))
     # Do not persist OTPs, access links, or HTML bodies, even for financial candidates.
     note='Financial email without a PDF. Review in Gmail; HDFC statement downloads remain manual.' if financial else 'No supported statement or recognizable transaction alert.'
     return sender,subject,[('message',None,'','needs_review' if financial else 'ignored',note,'')]
 
 
-def parse_indusind_alert(payload):
+def parse_transaction_alert(payload):
+    import parsers
     headers={h['name'].lower():h['value'] for h in payload.get('headers',[])}
-    if parseaddr(headers.get('from',''))[1].lower()!='transactionalert@indusind.com':
-        raise HTTPException(400,'No supported transaction-email parser for this sender yet.')
+    sender=parseaddr(headers.get('from',''))[1].lower()
     texts=[]
     for part in parts(payload):
         if part.get('filename') or part.get('mimeType') not in ('text/plain','text/html'): continue
@@ -171,20 +200,68 @@ def parse_indusind_alert(payload):
         if part.get('mimeType')=='text/html':
             parser=EmailText();parser.feed(value);value=' '.join(parser.text)
         texts.append(re.sub(r'\s+',' ',value))
-    pattern=re.compile(r'The transaction on your IndusInd Bank Credit Card ending\s+(\d{4})\s+for INR\s+([\d,]+\.\d{2})\s+on\s+(\d{2}-\s*\d{2}-\s*\d{4})\s+(\d{1,2}:\d{2}:\d{2}\s*[ap]m)\s+at\s+(.{1,300}?)\s+is\s+Approved\.',re.I)
-    matches={m.groups() for text in texts for m in pattern.finditer(text)}
-    if len(matches)!=1:
-        raise HTTPException(400,'Could not identify one approved purchase in this email. Declined, ambiguous or different templates remain in review.')
-    last4,amount,day,clock,description=next(iter(matches))
     try:
-        timestamp=datetime.strptime(re.sub(r'\s+','',day)+' '+re.sub(r'\s+','',clock),'%d-%m-%Y %I:%M:%S%p')
-        value=ledger.parse_amount(amount)
-        if value<=0: raise ValueError()
-    except ValueError: raise HTTPException(400,'The email contains an invalid transaction date or amount.') from None
-    return {'date':timestamp.date().isoformat(),'time':timestamp.strftime('%H:%M:%S'),
-        'description':description.strip(),'amount':-value,'currency':'INR','card_last4':last4,
-        'kind':'expense','provisional':True,'posted':False,
-        'note':'Approved authorization, not a settled statement entry. Available credit is not spending. Confirm card ownership and reconcile with the statement before posting.'}
+        import custom_parsers
+        custom=custom_parsers.email(ledger,sender,headers.get('subject',''),' '.join(texts))
+        if custom is not None: return custom
+        return parsers.parse_email(sender,headers.get('subject',''),' '.join(texts))
+    except (ValueError,ArithmeticError): raise HTTPException(400,'No single supported transaction was found in this email. Unsupported, invalid or ambiguous alerts remain in review.') from None
+
+
+def parse_indusind_alert(payload):
+    # Compatibility entry point; all parsing now uses the trusted registry.
+    return parse_transaction_alert(payload)
+
+
+def read_alert(item):
+    s=settings()
+    if not s or s['email']!=item['mailbox']: raise HTTPException(400,'Connect the mailbox this email belongs to.')
+    allowed=sender_filter(s)
+    if allowed is not None and item['sender'] not in allowed: raise HTTPException(400,'Sender is not approved.')
+    with google_client() as session:
+        message=get_json(session,'messages/'+quote(item['message_id'],safe=''),{'format':'full'})
+    headers={h['name'].lower():h['value'] for h in message.get('payload',{}).get('headers',[])}
+    if parseaddr(headers.get('from',''))[1].lower()!=item['sender']: raise HTTPException(400,'Email sender changed. Sync and review again.')
+    return parse_transaction_alert(message.get('payload',{}))
+
+
+def alert_candidates(c,account_id,parsed):
+    return [dict(r) for r in c.execute("""SELECT id,date,description,amount,status FROM transactions
+        WHERE account_id=? AND status!='deleted' AND abs(amount-?)<0.005
+        AND abs(julianday(date)-julianday(?))<=3 ORDER BY date,id""",(account_id,parsed['amount'],parsed['date']))]
+
+
+def confirmed_alert_account(c,p):
+    linked=c.execute('''SELECT a.* FROM email_account_links l JOIN accounts a ON a.id=l.account_id
+        WHERE l.issuer=? AND l.account_type=? AND l.last4=? AND a.type=? AND a.archived=0''',
+        (p['issuer'],p['account_type'],p['account_last4'],p['account_type'])).fetchone()
+    if linked: return linked
+    if p['account_type']=='credit_card':
+        return c.execute("SELECT a.* FROM card_identities i JOIN accounts a ON a.id=i.account_id WHERE i.issuer=? AND i.last4=? AND a.type='credit_card' AND a.archived=0",(p['issuer'],p['account_last4'])).fetchone()
+    return None
+
+
+def auto_process_alert(c,item,payload):
+    if item['status']!='needs_review' or item['filename'] or item['auto_suppressed']: return 'skipped'
+    try: p=parse_transaction_alert(payload)
+    except HTTPException:
+        c.execute("UPDATE gmail_intake SET note='Unsupported or ambiguous alert; not added. Use preview for details.' WHERE id=?",(item['id'],))
+        return 'unsupported'
+    account=confirmed_alert_account(c,p)
+    if not account:
+        c.execute("UPDATE gmail_intake SET note='Account ownership not confirmed. Preview and confirm once to enable automatic routing for this account ending.' WHERE id=?",(item['id'],))
+        return 'review'
+    matches=alert_candidates(c,account['id'],p)
+    status='review' if matches else 'active'
+    marker=hashlib.sha256((item['mailbox']+'|'+item['message_id']).encode()).hexdigest()[:24]
+    batch=c.execute('INSERT INTO imports(filename,account_id,created_at) VALUES(?,?,?)',('email-alert-'+marker,account['id'],datetime.now().isoformat())).lastrowid
+    category=ledger.categorise(p['description'],c)
+    fingerprint=ledger.raw_hash(p['date'],p['amount'],p['description'],account['name'])
+    original=dict(date=p['date'],amount=p['amount'],description=p['description'],category_id=category,kind=p['kind'],status='active')
+    c.execute('''INSERT INTO transactions(date,description,amount,account_id,category_id,status,source_file,raw_hash,source_hash,import_id,kind,previous_status,source_type,duplicate_of,email_original)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',(p['date'],p['description'],p['amount'],account['id'],category,status,'Email alert · '+p['parser_id'],fingerprint,fingerprint,batch,p['kind'],'active','email',matches[0]['id'] if matches else None,json.dumps(original)))
+    c.execute("UPDATE gmail_intake SET status='imported',import_id=?,note=?,preview_options=NULL WHERE id=?",(batch,'Possible duplicate sent to transaction Review.' if matches else 'Automatically added as an email/provisional transaction.',item['id']))
+    return 'review' if matches else 'added'
 
 
 def stage_message(c, mailbox, message, allowed):
@@ -225,6 +302,40 @@ def bind(module):
     global ledger
     ledger=module
     router=APIRouter(prefix='/api/gmail')
+
+    @router.get('/statement-rules')
+    def statement_rules():
+        return ledger.rows('''SELECT r.*,a.name account_name,p.name password_account_name FROM gmail_statement_rules r
+            JOIN accounts a ON a.id=r.account_id LEFT JOIN accounts p ON p.id=r.password_account_id ORDER BY r.id DESC''')
+
+    @router.post('/statement-rules')
+    async def save_statement_rule(request:Request):
+        try:
+            d=await request.json()
+            name=d['name'].strip(); sender=d['sender'].strip().lower()
+            subject=d.get('subject_keyword','').strip().lower(); filename=d.get('filename_keyword','').strip().lower()
+            account=int(d['account_id']); password=int(d['password_account_id']) if d.get('password_account_id') else None
+            rule_id=int(d['id']) if d.get('id') else None
+            if not name or len(name)>80 or len(sender)>254 or not re.fullmatch(r'[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+',sender) or not(subject or filename) or max(len(subject),len(filename))>200: raise ValueError()
+        except Exception: raise HTTPException(400,'Enter a rule name, exact sender address, and at least one subject or filename keyword.') from None
+        with ledger.conn() as c:
+            for account_id in (account,password):
+                if account_id is not None and not c.execute('SELECT 1 FROM accounts WHERE id=? AND archived=0',(account_id,)).fetchone(): raise HTTPException(400,'Choose an active account.')
+            if rule_id:
+                if not c.execute('SELECT 1 FROM gmail_statement_rules WHERE id=?',(rule_id,)).fetchone(): raise HTTPException(404,'Rule not found.')
+                c.execute('UPDATE gmail_statement_rules SET name=?,sender=?,subject_keyword=?,filename_keyword=?,account_id=?,password_account_id=? WHERE id=?',(name,sender,subject,filename,account,password,rule_id))
+            else:
+                rule_id=c.execute('INSERT INTO gmail_statement_rules(name,sender,subject_keyword,filename_keyword,account_id,password_account_id) VALUES(?,?,?,?,?,?)',(name,sender,subject,filename,account,password)).lastrowid
+            # Changed rules require a fresh preview, but never alter posted transactions.
+            c.execute("UPDATE gmail_intake SET preview_options=NULL WHERE status='pending'")
+        return {'ok':True,'id':rule_id}
+
+    @router.delete('/statement-rules/{rule_id}')
+    def delete_statement_rule(rule_id:int):
+        with ledger.conn() as c:
+            c.execute('DELETE FROM gmail_statement_rules WHERE id=?',(rule_id,))
+            c.execute("UPDATE gmail_intake SET preview_options=NULL WHERE status='pending'")
+        return {'ok':True}
 
     @router.get('/status')
     def status():
@@ -358,22 +469,46 @@ def bind(module):
                 params['q']='after:'+str(start)
             if s['cursor']: params['pageToken']=s['cursor']
             count=0
+            summary={'added':0,'review':0,'ignored':0,'unsupported':0,'skipped':0,'statements':0}
+            processed=set()
             with google_client() as session:
                 result=get_json(session,'messages',params)
-                for item in result.get('messages',[]):
+                message_ids=[i['id'] for i in result.get('messages',[])]
+                # Also revisit already-collected alerts, including those awaiting an account link.
+                with ledger.conn() as c:
+                    backlog=[r['message_id'] for r in c.execute("SELECT message_id FROM gmail_intake WHERE mailbox=? AND filename='' AND status='needs_review' AND auto_suppressed=0 ORDER BY id LIMIT 50",(s['email'],))]
+                for message_id in list(dict.fromkeys(message_ids+backlog)):
+                    if message_id in processed: continue
+                    processed.add(message_id)
                     with ledger.conn() as c:
-                        seen=c.execute('SELECT 1 FROM gmail_intake WHERE mailbox=? AND message_id=?',(s['email'],item['id'])).fetchone()
-                    if seen: continue
-                    # Metadata first: unrelated senders' bodies/attachments are not fetched.
-                    message=get_json(session,'messages/'+quote(item['id'],safe=''),{'format':'metadata','metadataHeaders':['From','Subject']})
+                        seen=c.execute('SELECT * FROM gmail_intake WHERE mailbox=? AND message_id=?',(s['email'],message_id)).fetchall()
+                    if seen and all(r['status']!='needs_review' or r['auto_suppressed'] for r in seen):
+                        summary['skipped']+=1
+                        continue
+                    message=get_json(session,'messages/'+quote(message_id,safe=''),{'format':'metadata','metadataHeaders':['From','Subject']})
                     headers={h['name'].lower():h['value'] for h in message.get('payload',{}).get('headers',[])}
                     allowed=sender_filter(s)
-                    if allowed is None or parseaddr(headers.get('from',''))[1].lower() in allowed:
-                        message=get_json(session,'messages/'+quote(item['id'],safe=''),{'format':'full'})
-                    with ledger.conn() as c: count+=stage_message(c,s['email'],message,allowed)
+                    eligible=allowed is None or parseaddr(headers.get('from',''))[1].lower() in allowed
+                    if eligible:
+                        message=get_json(session,'messages/'+quote(message_id,safe=''),{'format':'full'})
+                    with ledger.conn() as c:
+                        c.execute('BEGIN IMMEDIATE')
+                        count+=stage_message(c,s['email'],message,allowed)
+                        current=c.execute('SELECT * FROM gmail_intake WHERE mailbox=? AND message_id=?',(s['email'],message_id)).fetchall()
+                        for item in current:
+                            if item['status']=='ignored': summary['ignored']+=1
+                            elif item['status']=='pending' and item['filename']: summary['statements']+=1
+                            elif eligible and item['status']=='needs_review':
+                                # Recheck current security classification before parsing.
+                                classified=classify(message.get('payload',{}),allowed)
+                                if not any(x[3]=='needs_review' and not x[2] for x in classified[2]):
+                                    summary['review']+=1
+                                    continue
+                                summary[auto_process_alert(c,item,message.get('payload',{}))]+=1
+                            else: summary['skipped']+=1
             with ledger.conn() as c:
                 c.execute('UPDATE gmail_settings SET cursor=?,last_sync=? WHERE id=1',(result.get('nextPageToken'),datetime.now(timezone.utc).isoformat()))
-            return {'staged':count,'has_more':bool(result.get('nextPageToken'))}
+            return {'staged':count,'has_more':bool(result.get('nextPageToken')),**summary}
         except HTTPException: raise
         except credential_store.VaultUnavailable: raise
         except Exception: raise HTTPException(502,'Sync interrupted. Retry safely; completed messages will not be added twice.') from None
@@ -382,7 +517,9 @@ def bind(module):
     @router.get('/items')
     def items():
         with ledger.conn() as c:
-            return [dict(r) for r in c.execute("SELECT * FROM gmail_intake ORDER BY CASE WHEN status IN ('pending','needs_review') THEN 0 ELSE 1 END,received DESC,id DESC LIMIT 500")]
+            result=[dict(r) for r in c.execute("SELECT * FROM gmail_intake ORDER BY CASE WHEN status IN ('pending','needs_review') THEN 0 ELSE 1 END,received DESC,id DESC LIMIT 500")]
+            for item in result: item['routing']=statement_route(c,item)
+            return result
 
     @router.post('/items/{item_id}/dismiss')
     def dismiss(item_id:int):
@@ -390,26 +527,83 @@ def bind(module):
             c.execute("UPDATE gmail_intake SET status='dismissed' WHERE id=? AND import_id IS NULL",(item_id,))
         return {'ok':True}
 
+    @router.get('/parsers')
+    def parser_catalog():
+        import parsers
+        return {'parsers':parsers.catalog(),'policy':'Trusted built-in modules only. No uploaded code is executed.'}
+
     @router.post('/items/{item_id}/alert-preview')
-    def alert_preview(item_id:int):
+    async def alert_preview(item_id:int,request:Request):
         if not operation_lock.acquire(False): raise HTTPException(409,'A Gmail operation is in progress.')
         try:
-            with ledger.conn() as c:
-                row=c.execute('SELECT * FROM gmail_intake WHERE id=?',(item_id,)).fetchone()
+            with ledger.conn() as c: row=c.execute('SELECT * FROM gmail_intake WHERE id=?',(item_id,)).fetchone()
             if not row: raise HTTPException(404,'Email item not found.')
-            item=dict(row);s=settings()
+            item=dict(row)
             if item['filename'] or item['status']!='needs_review': raise HTTPException(400,'Select a transaction email awaiting review.')
-            if not s or s['email']!=item['mailbox']: raise HTTPException(400,'Connect the mailbox this email belongs to.')
-            allowed=sender_filter(s)
-            if allowed is not None and item['sender'] not in allowed: raise HTTPException(400,'Sender is not approved.')
-            with google_client() as session:
-                message=get_json(session,'messages/'+quote(item['message_id'],safe=''),{'format':'full'})
-            result=parse_indusind_alert(message.get('payload',{}))
+            result=await run_in_threadpool(read_alert,item)
+            try: choices=await request.json() if await request.body() else {}
+            except Exception: raise HTTPException(400,'Invalid preview choices.') from None
             with ledger.conn() as c:
-                account=c.execute('SELECT a.id,a.name FROM card_identities i JOIN accounts a ON a.id=i.account_id WHERE i.issuer=? AND i.last4=?',('indusind',result['card_last4'])).fetchone()
-            result['account_id']=account['id'] if account else None
-            result['account_name']=account['name'] if account else None
+                account=confirmed_alert_account(c,result)
+                if choices.get('account_id'):
+                    account=c.execute('SELECT id,name FROM accounts WHERE id=? AND type=? AND archived=0',(choices['account_id'],result['account_type'])).fetchone()
+                    if not account: raise HTTPException(400,'Choose an active account of the correct type.')
+                elif not account and result['account_type']=='credit_card':
+                    account=c.execute('SELECT a.id,a.name FROM card_identities i JOIN accounts a ON a.id=i.account_id WHERE i.issuer=? AND i.last4=? AND a.archived=0',(result['issuer'],result['account_last4'])).fetchone()
+                elif not account and result['issuer']=='idfc':
+                    candidates=c.execute("SELECT id,name FROM accounts WHERE type='bank' AND archived=0 AND lower(name) LIKE '%idfc%'").fetchall()
+                    if len(candidates)==1: account=candidates[0]
+                result['account_id']=account['id'] if account else None
+                result['account_name']=account['name'] if account else None
+                result['category_id']=ledger.categorise(result['description'],c)
+                result['matches']=alert_candidates(c,account['id'],result) if account else []
+                result['preview_token']=secrets.token_urlsafe(24)
+                snapshot={'parsed':result,'expires':time.time()+1800}
+                c.execute('UPDATE gmail_intake SET preview_options=? WHERE id=?',(json.dumps(snapshot),item_id))
             return result
+        finally: operation_lock.release()
+
+    @router.post('/items/{item_id}/alert-confirm')
+    async def alert_confirm(item_id:int,request:Request):
+        if not operation_lock.acquire(False): raise HTTPException(409,'A Gmail operation is in progress.')
+        try:
+            try: data=await request.json()
+            except Exception: raise HTTPException(400,'Invalid confirmation.') from None
+            with ledger.conn() as c:
+                c.execute('BEGIN IMMEDIATE')
+                item=c.execute('SELECT * FROM gmail_intake WHERE id=?',(item_id,)).fetchone()
+                if not item: raise HTTPException(404,'Email item not found.')
+                if item['status']=='imported': return {'already_imported':True,'import_id':item['import_id']}
+                if item['filename'] or item['status']!='needs_review': raise HTTPException(400,'This alert is not awaiting review.')
+                s=settings()
+                if not s or s['email']!=item['mailbox'] or (sender_filter(s) is not None and item['sender'] not in sender_filter(s)): raise HTTPException(400,'Mailbox or sender configuration changed. Preview again.')
+                try:
+                    snapshot=json.loads(item['preview_options']);p=snapshot['parsed']
+                    if snapshot['expires']<time.time() or not secrets.compare_digest(str(data.get('preview_token','')),p['preview_token']): raise ValueError()
+                except (TypeError,KeyError,ValueError): raise HTTPException(409,'Preview this email again before confirming.') from None
+                try: account_id=int(data['account_id']);category_id=int(data['category_id'])
+                except (TypeError,KeyError,ValueError): raise HTTPException(400,'Choose an account and category.') from None
+                if account_id!=p['account_id']: raise HTTPException(409,'Account changed. Preview again to check duplicates.')
+                account=c.execute('SELECT * FROM accounts WHERE id=? AND type=? AND archived=0',(account_id,p['account_type'])).fetchone()
+                if not account or not c.execute('SELECT 1 FROM categories WHERE id=?',(category_id,)).fetchone(): raise HTTPException(400,'Choose an active account and existing category.')
+                kind=data.get('kind',p['kind']);description=data.get('description',p['description'])
+                if kind not in ('expense','income','credit','refund','repayment','transfer') or not isinstance(description,str) or not 1<=len(description.strip())<=1000: raise HTTPException(400,'Check transaction type and description.')
+                if (kind in ('income','credit','refund') and p['amount']<0) or (kind=='expense' and p['amount']>0): raise HTTPException(400,'Transaction type does not match debit/credit direction.')
+                matches=alert_candidates(c,account_id,p)
+                existing_link=confirmed_alert_account(c,p)
+                if existing_link and existing_link['id']!=account_id: raise HTTPException(409,'This account ending is already linked to a different account. Resolve the ownership mapping before confirming.')
+                c.execute('INSERT INTO email_account_links(issuer,account_type,last4,account_id) VALUES(?,?,?,?) ON CONFLICT(issuer,account_type,last4) DO UPDATE SET account_id=excluded.account_id',(p['issuer'],p['account_type'],p['account_last4'],account_id))
+                status='review' if matches else ('excluded' if kind in ('transfer','repayment') else 'active')
+                marker=hashlib.sha256((item['mailbox']+'|'+item['message_id']).encode()).hexdigest()[:24]
+                batch=c.execute('INSERT INTO imports(filename,account_id,created_at) VALUES(?,?,?)',('email-alert-'+marker,account_id,datetime.now().isoformat())).lastrowid
+                description=description.strip()
+                fingerprint=ledger.raw_hash(p['date'],p['amount'],description,account['name'])
+                tx_id=c.execute("""INSERT INTO transactions(date,description,amount,account_id,category_id,status,source_file,raw_hash,source_hash,import_id,kind,previous_status,source_type,duplicate_of)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(p['date'],description,p['amount'],account_id,category_id,status,'Email alert · '+p['parser_id'],fingerprint,fingerprint,batch,kind,'excluded' if kind in ('transfer','repayment') else 'active','email',matches[0]['id'] if matches else None)).lastrowid
+                original=dict(date=p['date'],amount=p['amount'],description=p['description'],category_id=p['category_id'],kind=p['kind'],status='active')
+                c.execute('UPDATE transactions SET email_original=? WHERE id=?',(json.dumps(original),tx_id))
+                c.execute("UPDATE gmail_intake SET status='imported',import_id=?,note=?,preview_options=NULL WHERE id=?",(batch,'Email transaction saved as provisional. Account ending confirmed for future automatic sync.',item_id))
+            return {'transaction_id':tx_id,'import_id':batch,'review':bool(matches),'account':account['name'],'provisional':True}
         finally: operation_lock.release()
 
     @router.post('/items/{item_id}/preview')

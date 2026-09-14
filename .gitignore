@@ -34,3 +34,4 @@ htmlcov/
 # Local scripts contain personal statement names and account identities.
 /audit_readonly.py
 /maintenance_merge_sbi.py
+/*_local.py

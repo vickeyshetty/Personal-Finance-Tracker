@@ -12,6 +12,7 @@ import uuid
 import secrets
 import credential_store
 import gmail_ingestion
+import custom_parsers
 import sys
 from contextlib import contextmanager
 from collections import defaultdict
@@ -40,7 +41,7 @@ async def local_browser_guard(request: Request, call_next):
     if (request.headers.get('sec-fetch-site') == 'cross-site' or
             (origin and origin != str(request.base_url).rstrip('/'))):
         return JSONResponse({'detail': 'Cross-site access is not allowed.'}, status_code=403)
-    if '/statement-password' in request.url.path or request.url.path.startswith('/api/gmail/'):
+    if '/statement-password' in request.url.path or request.url.path.startswith(('/api/gmail/','/api/developer/')):
         if not secrets.compare_digest(request.headers.get('x-ledger-token', ''), LOCAL_TOKEN):
             return JSONResponse({'detail': 'Refresh Ledger before managing passwords.'}, status_code=403)
     response = await call_next(request)
@@ -81,17 +82,24 @@ def init_db():
     with conn() as c:
         c.executescript(SCHEMA)
         gmail_ingestion.init_schema(c)
+        custom_parsers.init_schema(c)
+        c.execute('CREATE TABLE IF NOT EXISTS removed_categories (name TEXT PRIMARY KEY COLLATE NOCASE)')
+        c.execute('CREATE TABLE IF NOT EXISTS badges (id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE NOT NULL, keywords TEXT NOT NULL, whole_word INTEGER NOT NULL DEFAULT 0)')
+        c.execute('CREATE TABLE IF NOT EXISTS preferences_migrations (name TEXT PRIMARY KEY)')
+        if not c.execute("SELECT 1 FROM preferences_migrations WHERE name='badges-v1'").fetchone():
+            for name, keywords in [('UPI',['UPI']),('EMI',['EMI','EASYEMI','SMARTEMI']),('NEFT',['NEFT']),('IMPS',['IMPS']),('Auto-pay',['AUTOPAY','NACH'])]:
+                c.execute('INSERT OR IGNORE INTO badges(name,keywords,whole_word) VALUES(?,?,1)',(name,json.dumps(keywords)))
+            c.execute("INSERT INTO preferences_migrations VALUES('badges-v1')")
         c.execute('CREATE TABLE IF NOT EXISTS statement_credentials (account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, credential_key TEXT UNIQUE NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS card_identities (issuer TEXT NOT NULL, last4 TEXT NOT NULL, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, PRIMARY KEY(issuer,last4))')
-        for name in DEFAULT_CATEGORIES:
-            c.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
-        c.execute("INSERT OR IGNORE INTO categories(name) VALUES('Online food order')")
-        c.execute("INSERT OR IGNORE INTO categories(name) VALUES('Quick commerce')")
+        for name in DEFAULT_CATEGORIES + ['Online food order','Quick commerce','Investments']:
+            if not c.execute('SELECT 1 FROM removed_categories WHERE name=?',(name,)).fetchone():
+                c.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
         old_people=c.execute("SELECT id FROM categories WHERE name='Money to/from people'").fetchone()
         people=c.execute("SELECT id FROM categories WHERE name='People'").fetchone()
         if old_people and not people:
             c.execute("UPDATE categories SET name='People' WHERE id=?",(old_people['id'],))
-        else:
+        elif not c.execute("SELECT 1 FROM removed_categories WHERE name='People'").fetchone():
             c.execute("INSERT OR IGNORE INTO categories(name) VALUES('People')")
         if not c.execute('SELECT 1 FROM accounts').fetchone():
             c.execute("INSERT INTO accounts(name,type) VALUES('Primary bank','bank')")
@@ -99,7 +107,11 @@ def init_db():
             CREATE TABLE IF NOT EXISTS imports (id INTEGER PRIMARY KEY, filename TEXT NOT NULL, account_id INTEGER, created_at TEXT NOT NULL, undone INTEGER DEFAULT 0, legacy INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, transaction_id INTEGER, before_json TEXT, changed_at TEXT);
             CREATE TABLE IF NOT EXISTS account_aliases (name TEXT PRIMARY KEY, account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);""")
-        additions = {'import_id':'INTEGER', 'source_hash':'TEXT', 'previous_status':'TEXT', 'kind':"TEXT DEFAULT 'other'", 'transfer_link':'TEXT'}
+        additions = {'import_id':'INTEGER', 'source_hash':'TEXT', 'previous_status':'TEXT', 'kind':"TEXT DEFAULT 'other'", 'transfer_link':'TEXT', 'source_type':"TEXT NOT NULL DEFAULT 'statement'", 'duplicate_of':'INTEGER', 'email_original':'TEXT'}
+        c.execute('''CREATE TABLE IF NOT EXISTS reconciliations (id INTEGER PRIMARY KEY, transaction_id INTEGER NOT NULL REFERENCES transactions(id), statement_import_id INTEGER NOT NULL REFERENCES imports(id), before_json TEXT NOT NULL, after_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)''')
+        reconciliation_columns={r['name'] for r in c.execute('PRAGMA table_info(reconciliations)')}
+        for field in ('statement_json','statement_hash'):
+            if field not in reconciliation_columns: c.execute('ALTER TABLE reconciliations ADD COLUMN '+field+' TEXT')
         columns = {r['name'] for r in c.execute('PRAGMA table_info(transactions)')}
         for name, definition in additions.items():
             if name not in columns: c.execute(f'ALTER TABLE transactions ADD COLUMN {name} {definition}')
@@ -187,7 +199,12 @@ def automatic_statement_account(database, filename, extension, contents, passwor
         with pdfplumber.open(io.BytesIO(contents), password=password) as document:
             text = document.pages[0].extract_text() or ''
         if 'GSTIN of SBI Card' in text:
-            return ensure_credit_card_account(database, filename if 'sbi card statement' in filename.lower() else 'SBI Card Statement')
+            # Layout identifies the issuer, not a particular card. Email filenames
+            # commonly contain document IDs; never replace a chosen account with
+            # a generic account when no card identity has been established.
+            if 'sbi card statement' in filename.lower() and re.search(r'_(\d{4})(?=_)', filename):
+                return ensure_credit_card_account(database, filename)
+            return None
         if 'IndusInd' in text or 'Payment Details for' in text:
             return ensure_account(database, 'CRED IndusInd Card', 'credit_card')
     if extension not in (".xls", ".xlsx", '.csv'):
@@ -254,6 +271,10 @@ def index():
     html=html.replace('</head>', f'<meta name="ledger-token" content="{LOCAL_TOKEN}"></head>')
     gmail_version=hashlib.sha256((ROOT/'static'/'gmail.js').read_bytes()).hexdigest()[:12]
     html=html.replace('</body>',f'<script src="/static/gmail.js?v={gmail_version}"></script></body>')
+    for asset in ('workspace.css','workspace.js'):
+        stamp=hashlib.sha256((ROOT/'static'/asset).read_bytes()).hexdigest()[:12]
+        tag=f'<link rel="stylesheet" href="/static/{asset}?v={stamp}">' if asset.endswith('.css') else f'<script src="/static/{asset}?v={stamp}"></script>'
+        html=html.replace('</head>' if asset.endswith('.css') else '</body>',tag+('</head>' if asset.endswith('.css') else '</body>'))
     return HTMLResponse(html,headers={'Cache-Control':'no-store'})
 
 @app.get("/api/bootstrap")
@@ -279,6 +300,8 @@ def delete_account(account_id: int):
         if transaction_count: raise HTTPException(400, "This account has transactions. Move or delete those transactions before removing the account.")
         credential = c.execute('SELECT credential_key FROM statement_credentials WHERE account_id=?', (account_id,)).fetchone()
         if credential: credential_store.remove(credential['credential_key'])
+        c.execute('DELETE FROM gmail_statement_rules WHERE account_id=?',(account_id,))
+        c.execute('UPDATE gmail_statement_rules SET password_account_id=NULL WHERE password_account_id=?',(account_id,))
         c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
     return {"ok": True}
 
@@ -327,6 +350,30 @@ def remove_statement_password(account_id: int):
     return {'saved': False}
 
 
+def strong_email_match(email,description):
+    original=json.loads(email['email_original']) if email['email_original'] else dict(email)
+    text=original['description']
+    if 'merchant not supplied' in text.lower(): return False
+    normal=lambda value: re.sub(r'\s+',' ',value).strip().lower()
+    return normal(text)==normal(description) or bool(set(re.findall(r'\b\d{10,}\b',text)) & set(re.findall(r'\b\d{10,}\b',description)))
+
+
+def reconcile_email(c,email,statement,batch_id):
+    """Promote one row in place; retain originals and preserve changed fields."""
+    before=dict(email)
+    baseline=json.loads(email['email_original']) if email['email_original'] else ({} if email['edited_at'] else before)
+    if not email['email_original'] and email['description'] in ('IDFC bank debit alert (merchant not supplied)','IDFC bank credit alert (merchant not supplied)'):
+        baseline['description']=email['description']
+    changes={field:(statement[field] if field in baseline and email[field]==baseline[field] else email[field]) for field in ('date','amount','description','category_id','kind','status')}
+    if changes['kind'] in ('transfer','repayment'): changes['status']='excluded'
+    audit_transaction(c,email['id'])
+    account=c.execute('SELECT name FROM accounts WHERE id=?',(email['account_id'],)).fetchone()
+    changes.update(source_type='statement',source_file=statement['source_file'],raw_hash=raw_hash(changes['date'],changes['amount'],changes['description'],account['name']))
+    c.execute('UPDATE transactions SET '+','.join(k+'=?' for k in changes)+' WHERE id=?',(*changes.values(),email['id']))
+    after=dict(c.execute('SELECT * FROM transactions WHERE id=?',(email['id'],)).fetchone())
+    c.execute('INSERT INTO reconciliations(transaction_id,statement_import_id,before_json,after_json,statement_json,statement_hash) VALUES(?,?,?,?,?,?)',(email['id'],batch_id,json.dumps(before),json.dumps(after),json.dumps(statement),raw_hash(statement['date'],statement['amount'],statement['description'],account['name'])))
+
+
 @app.post("/api/import")
 async def import_csv(account_id: int = Form(...), file: UploadFile = File(...), preview: bool = Form(False), override: bool = Form(False), password_account_id: Optional[int] = Form(None)):
     filename = file.filename or ""
@@ -352,11 +399,15 @@ async def import_csv(account_id: int = Form(...), file: UploadFile = File(...), 
     def field(*names): return next((fields[n] for n in names if n in fields), None)
     dcol, xcol, acol = field("date", "transaction date", "txn date"), field("description", "narration", "merchant", "particulars"), field("amount", "transaction amount", "debit")
     if not all((dcol, xcol, acol)): raise HTTPException(400, "Use headers Date, Description, Amount (or Transaction Date/Narration).")
-    created = review = skipped = 0
+    created = review = skipped = reconciled = 0
+    statement_keys=[]
+    for source_row in reader:
+        try: statement_keys.append((parse_date(source_row[dcol]),parse_amount(source_row[acol])))
+        except (ValueError,TypeError,AttributeError): pass
     with conn() as c:
         account = c.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
         if not account: raise HTTPException(404, "Account not found")
-        detected_account = automatic_statement_account(c, filename, extension, contents, password=password)
+        detected_account = None if override else automatic_statement_account(c, filename, extension, contents, password=password)
         if detected_account and not override:
             account = detected_account
         if account['archived']: raise HTTPException(400,'This account is archived. Unarchive it before importing.')
@@ -369,19 +420,30 @@ async def import_csv(account_id: int = Form(...), file: UploadFile = File(...), 
                 if not description: raise ValueError('Missing description')
             except (ValueError, TypeError, AttributeError): skipped += 1; continue
             h = raw_hash(day, amount, description, account["name"])
-            duplicate = c.execute("SELECT 1 FROM transactions WHERE (raw_hash=? OR source_hash=?) AND status!='deleted'", (h,h)).fetchone() or any(r['hash']==h for r in parsed)
+            nearby=c.execute("SELECT * FROM transactions WHERE account_id=? AND status!='deleted' AND abs(amount-?)<0.005 AND abs(julianday(date)-julianday(?))<=3 ORDER BY id",(account['id'],amount,day)).fetchall()
+            emails=[t for t in nearby if t['source_type']=='email']
+            overlap=emails[0] if emails else None
+            same_statement=sum(1 for dt,amt in statement_keys if abs(amt-amount)<.005 and abs((date.fromisoformat(dt)-date.fromisoformat(day)).days)<=3)
+            promote=overlap if len(nearby)==1 and same_statement==1 and overlap and overlap['status'] in ('active','excluded') and strong_email_match(overlap,description) else None
+            duplicate = c.execute("SELECT 1 FROM transactions t WHERE (raw_hash=? OR source_hash=? OR EXISTS(SELECT 1 FROM reconciliations r WHERE r.transaction_id=t.id AND r.active=1 AND r.statement_hash=?)) AND status!='deleted'", (h,h,h)).fetchone() or overlap or any(r['hash']==h for r in parsed)
             kind = infer_kind(description,amount,account['type'])
+            if promote: duplicate=False
             status = 'review' if duplicate else ('excluded' if kind in ('transfer','repayment') else 'active')
             category_id = card_payment_category if is_card_payment(description) else categorise(description, c)
             if kind == 'repayment': category_id = card_payment_category
             if kind == 'refund' and category_id == c.execute("SELECT id FROM categories WHERE name='Uncategorized'").fetchone()[0]: category_id = c.execute("SELECT id FROM categories WHERE name='Refund / Cashback'").fetchone()[0]
-            parsed.append(dict(date=day,description=description,amount=amount,kind=kind,duplicate=bool(duplicate),hash=h))
+            parsed.append(dict(date=day,description=description,amount=amount,kind=kind,duplicate=bool(duplicate),hash=h,reconciled=bool(promote)))
+            if promote:
+                if not preview: reconcile_email(c,promote,dict(date=day,amount=amount,description=description,category_id=category_id,kind=kind,status=status,source_file=filename),batch)
+                reconciled+=1
+                continue
             if not preview:
-                c.execute("INSERT INTO transactions(date,description,amount,account_id,category_id,status,source_file,raw_hash,source_hash,import_id,kind,previous_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (day,description,amount,account['id'],category_id,status,filename,h,h,batch,kind,'excluded' if kind in ('transfer','repayment') else 'active'))
+                inserted=c.execute("INSERT INTO transactions(date,description,amount,account_id,category_id,status,source_file,raw_hash,source_hash,import_id,kind,previous_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (day,description,amount,account['id'],category_id,status,filename,h,h,batch,kind,'excluded' if kind in ('transfer','repayment') else 'active')).lastrowid
+                if overlap: c.execute('UPDATE transactions SET duplicate_of=? WHERE id=?',(overlap['id'],inserted))
             review += bool(duplicate); created += not bool(duplicate)
         if not parsed: raise HTTPException(400,'No valid transactions found; nothing imported.')
         if preview: c.rollback()
-    return {"created": created, "review": review, "skipped": skipped, "account": account["name"], 'detected': bool(detected_account), 'import_id':batch, 'rows':parsed, 'debits':round(-sum(r['amount'] for r in parsed if r['amount']<0),2), 'credits':round(sum(r['amount'] for r in parsed if r['amount']>0),2)}
+    return {"created": created, "review": review, "skipped": skipped, "reconciled":reconciled,"account": account["name"], 'detected': bool(detected_account), 'import_id':batch, 'rows':parsed, 'debits':round(-sum(r['amount'] for r in parsed if r['amount']<0),2), 'credits':round(sum(r['amount'] for r in parsed if r['amount']>0),2)}
 
 def parse_date(value):
     if isinstance(value, (int, float)):
@@ -401,6 +463,8 @@ def parse_amount(value):
 
 def read_statement(contents: bytes, extension: str, filename: str = "", password=None):
     """Return normalised rows from CSV, supported bank/card Excel, or recognised card PDF."""
+    custom=custom_parsers.statement(sys.modules[__name__],contents,extension,password)
+    if custom is not None: return custom
     if extension == ".csv":
         matrix = list(csv.reader(io.StringIO(contents.decode('utf-8-sig'))))
         return normalise_excel_statement(matrix)
@@ -636,6 +700,21 @@ def resolve_review(tx_id: int, keep: bool = Form(...)):
         c.execute("UPDATE transactions SET previous_status='review',status=CASE WHEN ? THEN CASE WHEN kind IN ('transfer','repayment') THEN 'excluded' ELSE 'active' END ELSE 'deleted' END WHERE id=? AND status='review'", (keep, tx_id))
     return {"ok": True}
 
+
+@app.post('/api/transactions/{statement_id}/reconcile/{email_id}')
+def reconcile_review(statement_id:int,email_id:int):
+    with conn() as c:
+        c.execute('BEGIN IMMEDIATE')
+        statement=c.execute("SELECT * FROM transactions WHERE id=? AND status='review' AND source_type='statement'",(statement_id,)).fetchone()
+        email=c.execute("SELECT * FROM transactions WHERE id=? AND status IN ('active','excluded') AND source_type='email'",(email_id,)).fetchone()
+        if not statement or not email or statement['account_id']!=email['account_id'] or abs(statement['amount']-email['amount'])>.005 or abs((date.fromisoformat(statement['date'])-date.fromisoformat(email['date'])).days)>3:
+            raise HTTPException(400,'Select an active email entry for the same account and amount within three days.')
+        details=dict(statement);details['status']='excluded' if details['kind'] in ('transfer','repayment') else 'active'
+        reconcile_email(c,email,details,statement['import_id'])
+        audit_transaction(c,statement_id)
+        c.execute("UPDATE transactions SET status='deleted',previous_status='review',deleted_at=? WHERE id=?",(datetime.now().isoformat(),statement_id))
+    return {'ok':True,'transaction_id':email_id}
+
 def month_start(offset=0):
     today = date.today()
     index = today.year*12+today.month-1+offset
@@ -661,6 +740,28 @@ def month_breakdown(month: str):
     gross=round(-sum(t['amount'] for t in expenses),2);refund_total=round(sum(t['amount'] for t in refunds),2)
     food=grouped.get('Online food order',dict(gross=0,refunds=0,net=0,count=0))
     return dict(month=month,gross=gross,refunds=refund_total,net=round(gross-refund_total,2),categories=categories,top_category=categories[0]['category'] if categories and categories[0]['gross']>0 else None,online_food=food,transactions=expenses+refunds)
+
+@app.get('/api/cash-flow')
+def cash_flow(month: str):
+    try:
+        if not re.fullmatch(r'\d{4}-\d{2}', month): raise ValueError()
+        date.fromisoformat(month+'-01')
+    except ValueError:
+        raise HTTPException(400, 'Choose a valid month.')
+    # Bank cash movements, not card purchases: repayments count here only once.
+    data = tx_rows("a.type='bank' AND substr(t.date,1,7)=? AND t.date<=? AND (t.status='active' OR (t.status='excluded' AND t.kind='repayment')) AND t.kind!='transfer'", (month, date.today().isoformat()))
+    inflows = {'Salary / income': 0, 'Refunds': 0, 'Other credits': 0}
+    outflows = defaultdict(float)
+    for t in data:
+        if t['amount'] > 0:
+            label = 'Salary / income' if t['kind']=='income' else 'Refunds' if t['kind']=='refund' else 'Other credits'
+            inflows[label] += t['amount']
+        elif t['amount'] < 0:
+            label = 'Card repayments' if t['kind']=='repayment' else t['category']
+            outflows[label] += -t['amount']
+    incoming = round(sum(inflows.values()), 2)
+    outgoing = round(sum(outflows.values()), 2)
+    return dict(month=month, inflows={k:round(v,2) for k,v in inflows.items()}, outflows=sorted([dict(category=k,amount=round(v,2)) for k,v in outflows.items()],key=lambda g:g['amount'],reverse=True), incoming=incoming, outgoing=outgoing, net=round(incoming-outgoing,2), count=len(data))
 
 @app.get('/api/dashboard')
 def dashboard():
@@ -709,7 +810,7 @@ def detect_recurring(items):
 
 @app.get('/api/imports')
 def import_history():
-    return rows('SELECT i.*,a.name account,count(t.id) row_count FROM imports i LEFT JOIN accounts a ON a.id=i.account_id LEFT JOIN transactions t ON t.import_id=i.id GROUP BY i.id ORDER BY i.id DESC')
+    return rows('SELECT i.*,a.name account,count(t.id) row_count,(SELECT count(*) FROM reconciliations r WHERE r.statement_import_id=i.id AND r.active=1) reconciled_count FROM imports i LEFT JOIN accounts a ON a.id=i.account_id LEFT JOIN transactions t ON t.import_id=i.id GROUP BY i.id ORDER BY i.id DESC')
 
 @app.post('/api/imports/{batch_id}/undo')
 def undo_import(batch_id:int):
@@ -717,15 +818,26 @@ def undo_import(batch_id:int):
         batch=c.execute('SELECT * FROM imports WHERE id=?',(batch_id,)).fetchone()
         if not batch: raise HTTPException(404,'Import not found')
         if batch['undone']: return {'ok':True}
+        if c.execute('SELECT 1 FROM reconciliations r JOIN transactions t ON t.id=r.transaction_id WHERE r.active=1 AND t.import_id=?',(batch_id,)).fetchone():
+            raise HTTPException(409,'Undo the statement reconciliation import before undoing its original email import.')
+        for r in c.execute('SELECT * FROM reconciliations WHERE statement_import_id=? AND active=1',(batch_id,)).fetchall():
+            current=dict(c.execute('SELECT * FROM transactions WHERE id=?',(r['transaction_id'],)).fetchone())
+            if current!=json.loads(r['after_json']): raise HTTPException(409,'A reconciled transaction was edited afterward. Undo stopped to preserve those edits.')
+            before=json.loads(r['before_json']);audit_transaction(c,r['transaction_id'])
+            fields=[k for k in before if k!='id']
+            c.execute('UPDATE transactions SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',tuple(before[k] for k in fields)+(r['transaction_id'],))
+            c.execute('UPDATE reconciliations SET active=0 WHERE id=?',(r['id'],))
         for t in c.execute("SELECT id FROM transactions WHERE import_id=? AND status!='deleted'",(batch_id,)).fetchall(): audit_transaction(c,t['id'])
         c.execute("UPDATE transactions SET previous_status=status,status='deleted',deleted_at=? WHERE import_id=? AND status!='deleted'",(datetime.now().isoformat(),batch_id))
         c.execute('UPDATE imports SET undone=1 WHERE id=?',(batch_id,))
-        c.execute("UPDATE gmail_intake SET status='pending',import_id=NULL,preview_options=NULL,note='Import undone. Preview again to reimport, or dismiss this item.' WHERE import_id=?",(batch_id,))
+        c.execute("UPDATE gmail_intake SET status=CASE WHEN filename='' THEN 'needs_review' ELSE 'pending' END,import_id=NULL,preview_options=NULL,auto_suppressed=1,note='Import undone. Automatic re-add is paused for this item; preview and confirm to reimport.' WHERE import_id=?",(batch_id,))
     return {'ok':True}
 
 @app.post('/api/imports/{batch_id}/move')
 def move_import(batch_id:int, account_id:int=Form(...)):
     with conn() as c:
+        if c.execute('SELECT 1 FROM reconciliations r JOIN transactions t ON t.id=r.transaction_id WHERE r.active=1 AND (r.statement_import_id=? OR t.import_id=?)',(batch_id,batch_id)).fetchone():
+            raise HTTPException(409,'Undo statement reconciliation before moving either linked import.')
         account=c.execute('SELECT * FROM accounts WHERE id=?',(account_id,)).fetchone()
         if not account: raise HTTPException(400,'Account not found')
         if account['archived']: raise HTTPException(400,'Unarchive the destination account first.')
@@ -773,16 +885,68 @@ def list_rules():
     return rows('SELECT r.*,c.name category FROM rules r JOIN categories c ON c.id=r.category_id ORDER BY length(merchant_pattern) DESC,r.id')
 
 @app.post('/api/rules')
-def save_rule(pattern:str=Form(...),category_id:int=Form(...)):
-    if not pattern.strip(): raise HTTPException(400,'Enter a description or merchant pattern.')
+def save_rule(pattern:str=Form(...),category_id:int=Form(...),rule_id:Optional[int]=Form(None)):
+    pattern=pattern.strip().lower()
+    if not pattern or len(pattern)>200: raise HTTPException(400,'Enter a keyword or phrase between 1 and 200 characters.')
     with conn() as c:
         if not c.execute('SELECT 1 FROM categories WHERE id=?',(category_id,)).fetchone(): raise HTTPException(400,'Category not found')
-        c.execute('INSERT INTO rules(merchant_pattern,category_id) VALUES(?,?) ON CONFLICT(merchant_pattern) DO UPDATE SET category_id=excluded.category_id',(pattern.strip(),category_id))
+        if rule_id is not None:
+            if not c.execute('SELECT 1 FROM rules WHERE id=?',(rule_id,)).fetchone(): raise HTTPException(404,'Rule not found; reload before editing.')
+            c.execute('DELETE FROM rules WHERE id=?',(rule_id,))
+        c.execute('DELETE FROM rules WHERE lower(merchant_pattern)=?',(pattern,))
+        c.execute('INSERT INTO rules(merchant_pattern,category_id) VALUES(?,?)',(pattern,category_id))
     return {'ok':True}
 
 @app.delete('/api/rules/{rule_id}')
 def delete_rule(rule_id:int):
     with conn() as c: c.execute('DELETE FROM rules WHERE id=?',(rule_id,))
+    return {'ok':True}
+
+PROTECTED_CATEGORIES = {'Uncategorized','Transfers','Credit Card Payment','Refund / Cashback'}
+
+@app.post('/api/categories')
+def add_category(name: str = Form(...)):
+    name=name.strip()
+    if not name or len(name)>80: raise HTTPException(400,'Enter a category name between 1 and 80 characters.')
+    with conn() as c:
+        if c.execute('SELECT 1 FROM categories WHERE lower(name)=lower(?)',(name,)).fetchone(): raise HTTPException(400,'That category already exists.')
+        removed=c.execute('SELECT name FROM removed_categories WHERE name=?',(name,)).fetchone()
+        if removed: name=removed['name']
+        c.execute('INSERT INTO categories(name) VALUES(?)',(name,))
+        c.execute('DELETE FROM removed_categories WHERE name=?',(name,))
+    return {'ok':True}
+
+@app.delete('/api/categories/{category_id}')
+def remove_category(category_id: int):
+    with conn() as c:
+        category=c.execute('SELECT * FROM categories WHERE id=?',(category_id,)).fetchone()
+        if not category: raise HTTPException(404,'Category not found.')
+        if category['name'] in PROTECTED_CATEGORIES: raise HTTPException(400,'This category is required for accounting and cannot be removed.')
+        fallback=c.execute("SELECT id FROM categories WHERE name='Uncategorized'").fetchone()[0]
+        for t in c.execute('SELECT id FROM transactions WHERE category_id=?',(category_id,)).fetchall():
+            audit_transaction(c,t['id'])
+        changed=c.execute('UPDATE transactions SET category_id=?,edited_at=? WHERE category_id=?',(fallback,datetime.now().isoformat(),category_id)).rowcount
+        removed=c.execute('DELETE FROM rules WHERE category_id=?',(category_id,)).rowcount
+        c.execute('INSERT OR IGNORE INTO removed_categories(name) VALUES(?)',(category['name'],))
+        c.execute('DELETE FROM categories WHERE id=?',(category_id,))
+    return {'ok':True,'reclassified':changed,'rules_removed':removed}
+
+@app.get('/api/badges')
+def list_badges():
+    return [dict(**b,patterns=json.loads(b['keywords'])) for b in rows('SELECT * FROM badges ORDER BY name')]
+
+@app.post('/api/badges')
+def save_badge(name: str = Form(...), keywords: str = Form(...), whole_word: bool = Form(False)):
+    name=name.strip(); patterns=list(dict.fromkeys(k.strip().lower() for k in keywords.split(',') if k.strip()))
+    if not name or len(name)>40 or not patterns or len(patterns)>20 or any(len(p)>100 for p in patterns):
+        raise HTTPException(400,'Use a name up to 40 characters and 1–20 comma-separated keywords, up to 100 characters each.')
+    with conn() as c:
+        c.execute('INSERT INTO badges(name,keywords,whole_word) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET keywords=excluded.keywords,whole_word=excluded.whole_word',(name,json.dumps(patterns),int(whole_word)))
+    return {'ok':True}
+
+@app.delete('/api/badges/{badge_id}')
+def remove_badge(badge_id: int):
+    with conn() as c: c.execute('DELETE FROM badges WHERE id=?',(badge_id,))
     return {'ok':True}
 
 @app.get('/api/coverage')
@@ -791,3 +955,4 @@ def coverage():
 
 
 app.include_router(gmail_ingestion.bind(sys.modules[__name__]))
+app.include_router(custom_parsers.bind(sys.modules[__name__]))
