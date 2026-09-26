@@ -1,4 +1,5 @@
 [hidden]{display:none!important}
+#balancePanel{margin:24px 0}#balancePanel p{line-height:1.6}#balancePanel small{font-weight:400}#balancePanel .account-row{align-items:flex-start}
 .workspace-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 24px;border-bottom:1px solid #dce3df;padding-bottom:12px}
 .workspace-tabs button{border:1px solid transparent;background:transparent;color:#53665e;padding:10px 16px;border-radius:24px}
 .workspace-tabs button[aria-pressed=true]{background:#2c3955;color:white}

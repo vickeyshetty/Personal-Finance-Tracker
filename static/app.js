@@ -105,7 +105,7 @@ $('editForm').querySelector('.dialog-actions').insertAdjacentHTML('beforebegin',
 $('editTransfer').onclick=()=>{const id=+$('editForm').elements.id.value,t=state.transactions.find(t=>t.id===id);if(t?.transfer_link){$('editError').textContent='This entry is already linked. Save an edit to unlink it before pairing again.';return}$('editDialog').close();transfer(id)};
 function reconciliationButtons(t){
  if(t.source_type!=='statement')return '';
- return state.transactions.filter(x=>x.source_type==='email'&&x.account_id===t.account_id&&Math.abs(x.amount-t.amount)<.005&&Math.abs(new Date(x.date)-new Date(t.date))<=3*86400000).map(x=>`<div><small>Email #${x.id}: ${esc(x.date)} · ${esc(x.description)} · ${fmt(x.amount)}</small><button data-reconcile="${t.id}" data-email="${x.id}">Use statement details for email #${x.id}</button></div>`).join('');
+ return state.transactions.filter(x=>x.source_type==='email'&&x.account_id===t.account_id&&Math.abs(x.amount-t.amount)<.005&&x.date===t.date).map(x=>`<div><small>Email #${x.id}: ${esc(x.date)} · ${esc(x.description)} · ${fmt(x.amount)}</small><button data-reconcile="${t.id}" data-email="${x.id}">Use statement details for email #${x.id}</button></div>`).join('');
 }
 function donutSlicePath(start,end){
  const point=(radius,angle)=>{const radians=(angle-90)*Math.PI/180;return `${105+radius*Math.cos(radians)} ${105+radius*Math.sin(radians)}`},mid=(start+end)/2;

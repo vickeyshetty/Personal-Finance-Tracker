@@ -114,7 +114,7 @@ class GmailTests(unittest.TestCase):
         self.assertEqual(result.status_code,200,result.text);self.assertFalse(result.json()['review'])
         self.assertTrue(self.client.post(f'/api/gmail/items/{item}/alert-confirm',json=body).json()['already_imported'])
         tx=app.bootstrap()['transactions'];self.assertEqual(len(tx),1);self.assertEqual(tx[0]['source_type'],'email')
-        statement=self.client.post('/api/import',data={'account_id':1},files={'file':('test.csv',b'Date,Description,Amount\n2026-09-15,Actual merchant,-398\n','text/csv')}).json()
+        statement=self.client.post('/api/import',data={'account_id':1},files={'file':('test.csv',b'Date,Description,Amount\n2026-09-14,Actual merchant,-398\n','text/csv')}).json()
         self.assertEqual(statement['review'],1)
         self.assertEqual(app.bootstrap()['review'][0]['duplicate_of'],tx[0]['id'])
         self.client.post('/api/imports/'+str(result.json()['import_id'])+'/undo')
@@ -174,7 +174,7 @@ class GmailTests(unittest.TestCase):
         tx=app.bootstrap()['transactions'][0]
         category=next(c['id'] for c in app.bootstrap()['categories'] if c['name']=='People')
         self.client.put('/api/transactions/'+str(tx['id']),json={**tx,'category_id':category})
-        statement=self.client.post('/api/import',data={'account_id':1},files={'file':('test.csv',b'Date,Description,Amount\n2026-09-15,Actual merchant,-398\n','text/csv')}).json()
+        statement=self.client.post('/api/import',data={'account_id':1},files={'file':('test.csv',b'Date,Description,Amount\n2026-09-14,Actual merchant,-398\n','text/csv')}).json()
         candidate=app.bootstrap()['review'][0]
         result=self.client.post(f"/api/transactions/{candidate['id']}/reconcile/{tx['id']}")
         self.assertEqual(result.status_code,200,result.text)
@@ -190,7 +190,7 @@ class GmailTests(unittest.TestCase):
         with patch.object(gmail,'read_alert',return_value=p):
             preview=self.client.post(f'/api/gmail/items/{item}/alert-preview',json={'account_id':1}).json()
         self.client.post(f'/api/gmail/items/{item}/alert-confirm',json={**preview,'account_id':1,'category_id':preview['category_id']})
-        csv=b'Date,Description,Amount\n2026-09-15,Shop settled 123456789012,-398\n'
+        csv=b'Date,Description,Amount\n2026-09-14,Shop settled 123456789012,-398\n'
         trial=self.client.post('/api/import',data={'account_id':1,'preview':True},files={'file':('test.csv',csv,'text/csv')}).json()
         self.assertEqual(trial['reconciled'],1);self.assertEqual(app.bootstrap()['transactions'][0]['source_type'],'email')
         result=self.client.post('/api/import',data={'account_id':1},files={'file':('test.csv',csv,'text/csv')}).json()
@@ -201,6 +201,32 @@ class GmailTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/imports/'+str(result['import_id'])+'/undo').status_code,409)
         repeated=self.client.post('/api/import',data={'account_id':1},files={'file':('test.csv',csv,'text/csv')}).json()
         self.assertEqual(repeated['review'],1)
+
+    def test_duplicate_candidates_require_same_calendar_date(self):
+        self.client.post('/api/import',data={'account_id':1},files={'file':('test.csv',b'Date,Description,Amount\n2026-09-13,Previous day,-398\n2026-09-15,Next day,-398\n','text/csv')})
+        item,p=self.prepare_alert()
+        with patch.object(gmail,'read_alert',return_value=p):
+            trial=self.client.post(f'/api/gmail/items/{item}/alert-preview',json={'account_id':1}).json()
+        self.assertEqual(trial['matches'],[])
+        self.client.post('/api/gmail/items/'+str(item)+'/alert-confirm',json={**trial,'account_id':1,'category_id':trial['category_id']})
+        with app.conn() as c:
+            self.assertEqual(len(gmail.alert_candidates(c,1,p)),1)
+        # Neighboring-day statement with identical description still cannot reconcile.
+        text=('Date,Description,Amount\n2026-09-16,'+p['description']+',-398\n').encode()
+        result=self.client.post('/api/import',data={'account_id':1},files={'file':('later.csv',text,'text/csv')}).json()
+        self.assertEqual((result['created'],result['review'],result['reconciled']),(1,0,0))
+
+    def test_manual_reconciliation_rejects_adjacent_date(self):
+        item,p=self.prepare_alert()
+        with patch.object(gmail,'read_alert',return_value=p):
+            trial=self.client.post(f'/api/gmail/items/{item}/alert-preview',json={'account_id':1}).json()
+        self.client.post(f'/api/gmail/items/{item}/alert-confirm',json={**trial,'account_id':1,'category_id':trial['category_id']})
+        email=app.bootstrap()['transactions'][0]
+        self.client.post('/api/import',data={'account_id':1},files={'file':('same.csv',b'Date,Description,Amount\n2026-09-14,Unknown merchant,-398\n','text/csv')})
+        statement=app.bootstrap()['review'][0]
+        with app.conn() as c:c.execute('UPDATE transactions SET date=? WHERE id=?',('2026-09-15',statement['id']))
+        result=self.client.post(f"/api/transactions/{statement['id']}/reconcile/{email['id']}")
+        self.assertEqual(result.status_code,400)
 
     def test_configuration_secret_is_vault_only_and_urls_fixed(self):
         self.assertNotIn(b'synthetic-secret',app.DB.read_bytes())

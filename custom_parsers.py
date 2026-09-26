@@ -16,6 +16,7 @@ MANUAL_BUILTINS=[{'id':'builtin.csv','name':'CSV transaction columns','kind':'ta
  {'id':'builtin.bank-excel','name':'HDFC / IDFC bank spreadsheets','kind':'table'},
  {'id':'builtin.card-excel','name':'HDFC card spreadsheets','kind':'table'},
  {'id':'builtin.sbi-pdf','name':'SBI Card PDF','kind':'pdf'},
+ {'id':'builtin.hdfc-pdf','name':'HDFC credit-card PDF','kind':'pdf'},
  {'id':'builtin.indusind-pdf','name':'CRED / IndusInd PDF','kind':'pdf'}]
 
 def init_schema(c):

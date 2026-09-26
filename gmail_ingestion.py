@@ -18,6 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.datastructures import UploadFile
 from starlette.concurrency import run_in_threadpool
 import credential_store
+import balances
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
 SERVICE = 'Ledger.Gmail'
@@ -29,6 +30,7 @@ ledger = None
 
 
 def init_schema(c):
+    balances.init_schema(c)
     c.executescript('''
     CREATE TABLE IF NOT EXISTS gmail_settings (
       id INTEGER PRIMARY KEY CHECK(id=1), vault_key TEXT NOT NULL,
@@ -45,6 +47,8 @@ def init_schema(c):
         c.execute('ALTER TABLE gmail_intake ADD COLUMN preview_options TEXT')
     if 'auto_suppressed' not in {r['name'] for r in c.execute('PRAGMA table_info(gmail_intake)')}:
         c.execute('ALTER TABLE gmail_intake ADD COLUMN auto_suppressed INTEGER NOT NULL DEFAULT 0')
+    if 'balance_checked' not in {r['name'] for r in c.execute('PRAGMA table_info(gmail_intake)')}:
+        c.execute('ALTER TABLE gmail_intake ADD COLUMN balance_checked INTEGER NOT NULL DEFAULT 0')
     c.execute('''CREATE TABLE IF NOT EXISTS email_account_links (
         issuer TEXT NOT NULL, account_type TEXT NOT NULL, last4 TEXT NOT NULL,
         account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -59,7 +63,7 @@ def init_schema(c):
 
 
 def statement_route(c, item):
-    if item['status']!='pending' or not item['filename'].lower().endswith('.pdf'):
+    if item['status'] not in ('pending','imported') or not item['filename'].lower().endswith('.pdf'):
         return None
     matches=[]
     for row in c.execute('''SELECT r.*,a.name account_name,p.name password_account_name
@@ -228,7 +232,7 @@ def read_alert(item):
 def alert_candidates(c,account_id,parsed):
     return [dict(r) for r in c.execute("""SELECT id,date,description,amount,status FROM transactions
         WHERE account_id=? AND status!='deleted' AND abs(amount-?)<0.005
-        AND abs(julianday(date)-julianday(?))<=3 ORDER BY date,id""",(account_id,parsed['amount'],parsed['date']))]
+        AND date=? ORDER BY date,id""",(account_id,parsed['amount'],parsed['date']))]
 
 
 def confirmed_alert_account(c,p):
@@ -274,6 +278,17 @@ def stage_message(c, mailbox, message, allowed):
           VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
           (mailbox,message['id'],part,attachment,filename,sender,subject,received,status,note,excerpt))
         count += result.rowcount
+    if (allowed is None or sender in allowed) and subject!='Security / verification email':
+        texts=[]
+        for part in parts(message.get('payload',{})):
+            if part.get('filename') or part.get('mimeType') not in ('text/plain','text/html'):continue
+            value=decode(part.get('body',{}).get('data','')).decode('utf-8',errors='replace')[:100000]
+            if part.get('mimeType')=='text/html':
+                parser=EmailText();parser.feed(value);value=' '.join(parser.text)
+            texts.append(value)
+        if balances.capture(c,mailbox,message['id'],received,sender,' '.join(texts)):
+            c.execute("UPDATE gmail_intake SET note='Balance snapshot recorded separately; not a transaction.' WHERE mailbox=? AND message_id=? AND status='ignored'",(mailbox,message['id']))
+    c.execute('UPDATE gmail_intake SET balance_checked=1 WHERE mailbox=? AND message_id=?',(mailbox,message['id']))
     return count
 
 
@@ -302,6 +317,23 @@ def bind(module):
     global ledger
     ledger=module
     router=APIRouter(prefix='/api/gmail')
+
+    @router.get('/balances')
+    def balance_overview():
+        with ledger.conn() as c:return balances.overview(c)
+
+    @router.post('/balances/{snapshot_id}/link')
+    async def link_balance(snapshot_id:int,request:Request):
+        try: account_id=int((await request.json())['account_id'])
+        except (ValueError,TypeError,KeyError):raise HTTPException(400,'Choose a bank account.')
+        with ledger.conn() as c:
+            snapshot=c.execute('SELECT * FROM balance_snapshots WHERE id=?',(snapshot_id,)).fetchone()
+            account=c.execute("SELECT id FROM accounts WHERE id=? AND type='bank' AND archived=0",(account_id,)).fetchone()
+            if not snapshot or not account:raise HTTPException(400,'Choose an active bank account and an existing snapshot.')
+            existing=c.execute("SELECT account_id FROM email_account_links WHERE issuer=? AND account_type='bank' AND last4=?",(snapshot['issuer'],snapshot['last4'])).fetchone()
+            if existing and existing['account_id']!=account_id:raise HTTPException(409,'This ending is already linked to another account.')
+            c.execute("INSERT OR IGNORE INTO email_account_links VALUES(?,'bank',?,?)",(snapshot['issuer'],snapshot['last4'],account_id))
+        return {'ok':True}
 
     @router.get('/statement-rules')
     def statement_rules():
@@ -477,12 +509,14 @@ def bind(module):
                 # Also revisit already-collected alerts, including those awaiting an account link.
                 with ledger.conn() as c:
                     backlog=[r['message_id'] for r in c.execute("SELECT message_id FROM gmail_intake WHERE mailbox=? AND filename='' AND status='needs_review' AND auto_suppressed=0 ORDER BY id LIMIT 50",(s['email'],))]
+                    backlog += [r['message_id'] for r in c.execute("SELECT message_id FROM gmail_intake WHERE mailbox=? AND sender='alerts@hdfcbank.bank.in' AND filename='' AND status='ignored' AND balance_checked=0 AND subject LIKE '%Account update%' ORDER BY id LIMIT 50",(s['email'],))]
                 for message_id in list(dict.fromkeys(message_ids+backlog)):
                     if message_id in processed: continue
                     processed.add(message_id)
                     with ledger.conn() as c:
                         seen=c.execute('SELECT * FROM gmail_intake WHERE mailbox=? AND message_id=?',(s['email'],message_id)).fetchall()
-                    if seen and all(r['status']!='needs_review' or r['auto_suppressed'] for r in seen):
+                    balance_backfill=any(r['status']=='ignored' and not r['balance_checked'] and r['sender']=='alerts@hdfcbank.bank.in' and 'account update' in r['subject'].lower() for r in seen)
+                    if seen and not balance_backfill and all(r['status']!='needs_review' or r['auto_suppressed'] for r in seen):
                         summary['skipped']+=1
                         continue
                     message=get_json(session,'messages/'+quote(message_id,safe=''),{'format':'metadata','metadataHeaders':['From','Subject']})

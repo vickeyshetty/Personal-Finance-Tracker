@@ -271,7 +271,7 @@ def index():
     html=html.replace('</head>', f'<meta name="ledger-token" content="{LOCAL_TOKEN}"></head>')
     gmail_version=hashlib.sha256((ROOT/'static'/'gmail.js').read_bytes()).hexdigest()[:12]
     html=html.replace('</body>',f'<script src="/static/gmail.js?v={gmail_version}"></script></body>')
-    for asset in ('workspace.css','workspace.js'):
+    for asset in ('workspace.css','workspace.js','balances.js'):
         stamp=hashlib.sha256((ROOT/'static'/asset).read_bytes()).hexdigest()[:12]
         tag=f'<link rel="stylesheet" href="/static/{asset}?v={stamp}">' if asset.endswith('.css') else f'<script src="/static/{asset}?v={stamp}"></script>'
         html=html.replace('</head>' if asset.endswith('.css') else '</body>',tag+('</head>' if asset.endswith('.css') else '</body>'))
@@ -420,10 +420,10 @@ async def import_csv(account_id: int = Form(...), file: UploadFile = File(...), 
                 if not description: raise ValueError('Missing description')
             except (ValueError, TypeError, AttributeError): skipped += 1; continue
             h = raw_hash(day, amount, description, account["name"])
-            nearby=c.execute("SELECT * FROM transactions WHERE account_id=? AND status!='deleted' AND abs(amount-?)<0.005 AND abs(julianday(date)-julianday(?))<=3 ORDER BY id",(account['id'],amount,day)).fetchall()
+            nearby=c.execute("SELECT * FROM transactions WHERE account_id=? AND status!='deleted' AND abs(amount-?)<0.005 AND date=? ORDER BY id",(account['id'],amount,day)).fetchall()
             emails=[t for t in nearby if t['source_type']=='email']
             overlap=emails[0] if emails else None
-            same_statement=sum(1 for dt,amt in statement_keys if abs(amt-amount)<.005 and abs((date.fromisoformat(dt)-date.fromisoformat(day)).days)<=3)
+            same_statement=sum(1 for dt,amt in statement_keys if abs(amt-amount)<.005 and dt==day)
             promote=overlap if len(nearby)==1 and same_statement==1 and overlap and overlap['status'] in ('active','excluded') and strong_email_match(overlap,description) else None
             duplicate = c.execute("SELECT 1 FROM transactions t WHERE (raw_hash=? OR source_hash=? OR EXISTS(SELECT 1 FROM reconciliations r WHERE r.transaction_id=t.id AND r.active=1 AND r.statement_hash=?)) AND status!='deleted'", (h,h,h)).fetchone() or overlap or any(r['hash']==h for r in parsed)
             kind = infer_kind(description,amount,account['type'])
@@ -472,9 +472,14 @@ def read_statement(contents: bytes, extension: str, filename: str = "", password
         import pdfplumber
         with pdfplumber.open(io.BytesIO(contents), password=password) as document:
             first_page = document.pages[0].extract_text() or ''
+            from parsers import hdfc_statement
+            if hdfc_statement.matches(first_page):
+                return hdfc_statement.parse_pages([first_page]+[p.extract_text() or '' for p in document.pages[1:]])
         if 'GSTIN of SBI Card' in first_page:
             return sbi_card_pdf_rows(contents, password=password)
-        return cred_indusind_pdf_rows(contents, password=password)
+        if 'IndusInd' in first_page or 'Payment Details for ' in first_page or 'Purchases & Cash Transactions for ' in first_page:
+            return cred_indusind_pdf_rows(contents, password=password)
+        raise ValueError('Unrecognized PDF statement layout. No supported bank/card parser matched this document.')
     try:
         matrix = xls_matrix(contents) if extension == ".xls" else xlsx_matrix(contents)
     except (zipfile.BadZipFile, ET.ParseError, KeyError, ValueError) as exc:
@@ -707,8 +712,8 @@ def reconcile_review(statement_id:int,email_id:int):
         c.execute('BEGIN IMMEDIATE')
         statement=c.execute("SELECT * FROM transactions WHERE id=? AND status='review' AND source_type='statement'",(statement_id,)).fetchone()
         email=c.execute("SELECT * FROM transactions WHERE id=? AND status IN ('active','excluded') AND source_type='email'",(email_id,)).fetchone()
-        if not statement or not email or statement['account_id']!=email['account_id'] or abs(statement['amount']-email['amount'])>.005 or abs((date.fromisoformat(statement['date'])-date.fromisoformat(email['date'])).days)>3:
-            raise HTTPException(400,'Select an active email entry for the same account and amount within three days.')
+        if not statement or not email or statement['account_id']!=email['account_id'] or abs(statement['amount']-email['amount'])>.005 or statement['date']!=email['date']:
+            raise HTTPException(400,'Select an active email entry for the same account and amount on the same calendar date.')
         details=dict(statement);details['status']='excluded' if details['kind'] in ('transfer','repayment') else 'active'
         reconcile_email(c,email,details,statement['import_id'])
         audit_transaction(c,statement_id)
