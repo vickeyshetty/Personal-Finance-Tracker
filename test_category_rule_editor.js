@@ -1,0 +1,32 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const source=fs.readFileSync('static/app.js','utf8');
+const fields={ruleEditorTitle:{},saveCategoryRule:{},ruleStatus:{textContent:'old error'}};
+// Hidden inputs retain their value across native form.reset(); the handler must clear it.
+fields.ruleForm={elements:{rule_id:{value:'42'},pattern:{focus(){this.focused=true}}},reset(){this.onreset()}};
+const context={$:id=>fields[id]};vm.createContext(context);
+vm.runInContext(source.slice(source.indexOf('function setRuleEditorMode('),source.indexOf('function renderManagement(')),context);
+context.setRuleEditorMode(true);assert.equal(fields.saveCategoryRule.textContent,'Save changes');
+assert.ok(!source.includes('newCategoryRule'));
+assert.ok(source.includes('<button type="reset">Cancel / clear</button>'));
+fields.ruleForm.reset();
+assert.equal(fields.ruleForm.elements.rule_id.value,'');assert.equal(fields.saveCategoryRule.textContent,'Add rule');
+assert.equal(fields.ruleEditorTitle.textContent,'Add a category rule');assert.equal(fields.ruleStatus.textContent,'');
+const submissions=[];
+context.FormData=class extends Map{constructor(form){super([['rule_id',form.elements.rule_id.value],['pattern','new merchant'],['category_id','1']])}};
+context.api=async(url,opts)=>submissions.push(Object.fromEntries(opts.body));
+context.loadRules=async()=>{};
+const submit=source.slice(source.indexOf("$('ruleForm').onsubmit="),source.indexOf('\n',source.indexOf("$('ruleForm').onsubmit=")));
+vm.runInContext(submit,context);
+(async()=>{
+ await fields.ruleForm.onsubmit({preventDefault(){},target:fields.ruleForm});
+ assert.ok(!Object.hasOwn(submissions[0],'rule_id'),'A new rule must not submit an old edit ID');
+ assert.match(fields.ruleStatus.textContent,/Rule added/);
+ fields.ruleForm.elements.rule_id.value='42';
+ await fields.ruleForm.onsubmit({preventDefault(){},target:fields.ruleForm});
+ assert.equal(submissions[1].rule_id,'42');assert.equal(fields.ruleForm.elements.rule_id.value,'');
+ assert.equal(fields.ruleStatus.textContent,'Rule updated.');
+ context.api=async()=>{throw Error('Please choose a category')};
+ await fields.ruleForm.onsubmit({preventDefault(){},target:fields.ruleForm});
+ assert.equal(fields.ruleStatus.textContent,'Please choose a category');
+ console.log('Rule create/edit payloads, reset, save feedback and inline errors passed.');
+})().catch(e=>{console.error(e);process.exitCode=1});

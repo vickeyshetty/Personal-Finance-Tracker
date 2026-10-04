@@ -1,7 +1,8 @@
 """Trusted, explicitly registered parser modules. Never load code from uploads."""
 from . import idfc_alert, indusind_alert, hdfc_alert, hdfc_bank_alert
+from . import sbi_alert, idfc_neft_alert, indusind_repayment
 
-PARSERS = (idfc_alert, indusind_alert, hdfc_alert, hdfc_bank_alert)
+PARSERS = (idfc_alert, indusind_alert, hdfc_alert, hdfc_bank_alert, sbi_alert, idfc_neft_alert, indusind_repayment)
 
 def catalog():
     return [p.INFO for p in PARSERS]

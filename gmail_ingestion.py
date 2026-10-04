@@ -19,6 +19,7 @@ from starlette.datastructures import UploadFile
 from starlette.concurrency import run_in_threadpool
 import credential_store
 import balances
+import transaction_timing
 
 SCOPE = 'https://www.googleapis.com/auth/gmail.readonly'
 SERVICE = 'Ledger.Gmail'
@@ -31,6 +32,7 @@ ledger = None
 
 def init_schema(c):
     balances.init_schema(c)
+    transaction_timing.init_schema(c)
     c.executescript('''
     CREATE TABLE IF NOT EXISTS gmail_settings (
       id INTEGER PRIMARY KEY CHECK(id=1), vault_key TEXT NOT NULL,
@@ -180,6 +182,11 @@ def classify(payload, allowed):
             text.append(value[:10000])
     if result: return sender,subject,result
     plain='\n'.join(text)[:10000]
+    if sender=='alerts@hdfcbank.bank.in' and not re.search(r'\b(has been debited|is debited|credited|spent|approved)\b',plain,re.I) and re.search(r'There is an upcoming E-mandate \(Auto payment\).*?Amount will be debited from your HDFC Bank Credit Card', ' '.join(plain.split()), re.I):
+        try:
+            parse_transaction_alert(payload)
+        except HTTPException:
+            return sender,subject,[('message',None,'','ignored','Upcoming auto-payment reminder, not a completed transaction.','')]
     combined=subject+' '+plain
     # Conservative classification only: alerts never become posted transactions.
     financial = bool(re.search(r'\b(debited|credited|spent|transaction|statement|payment received|refund)\b', combined, re.I))
@@ -236,6 +243,7 @@ def alert_candidates(c,account_id,parsed):
 
 
 def confirmed_alert_account(c,p):
+    if not p.get('account_last4'): return None
     linked=c.execute('''SELECT a.* FROM email_account_links l JOIN accounts a ON a.id=l.account_id
         WHERE l.issuer=? AND l.account_type=? AND l.last4=? AND a.type=? AND a.archived=0''',
         (p['issuer'],p['account_type'],p['account_last4'],p['account_type'])).fetchone()
@@ -253,12 +261,14 @@ def auto_process_alert(c,item,payload):
         return 'unsupported'
     account=confirmed_alert_account(c,p)
     if not account:
-        c.execute("UPDATE gmail_intake SET note='Account ownership not confirmed. Preview and confirm once to enable automatic routing for this account ending.' WHERE id=?",(item['id'],))
+        note='Account ownership not confirmed. Preview and confirm once to enable automatic routing for this account ending.' if p.get('account_last4') else 'No account number supplied. Preview and select the destination account for this email; automatic routing is disabled.'
+        c.execute('UPDATE gmail_intake SET note=? WHERE id=?',(note,item['id']))
         return 'review'
     matches=alert_candidates(c,account['id'],p)
     status='review' if matches else 'active'
     marker=hashlib.sha256((item['mailbox']+'|'+item['message_id']).encode()).hexdigest()[:24]
     batch=c.execute('INSERT INTO imports(filename,account_id,created_at) VALUES(?,?,?)',('email-alert-'+marker,account['id'],datetime.now().isoformat())).lastrowid
+    transaction_timing.save(c,batch,p)
     category=ledger.categorise(p['description'],c)
     fingerprint=ledger.raw_hash(p['date'],p['amount'],p['description'],account['name'])
     original=dict(date=p['date'],amount=p['amount'],description=p['description'],category_id=category,kind=p['kind'],status='active')
@@ -278,6 +288,8 @@ def stage_message(c, mailbox, message, allowed):
           VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
           (mailbox,message['id'],part,attachment,filename,sender,subject,received,status,note,excerpt))
         count += result.rowcount
+        if status=='ignored' and note=='Upcoming auto-payment reminder, not a completed transaction.':
+            c.execute("UPDATE gmail_intake SET status='ignored',note=?,preview_options=NULL WHERE mailbox=? AND message_id=? AND filename='' AND status='needs_review'",(note,mailbox,message['id']))
     if (allowed is None or sender in allowed) and subject!='Security / verification email':
         texts=[]
         for part in parts(message.get('payload',{})):
@@ -626,17 +638,20 @@ def bind(module):
                 matches=alert_candidates(c,account_id,p)
                 existing_link=confirmed_alert_account(c,p)
                 if existing_link and existing_link['id']!=account_id: raise HTTPException(409,'This account ending is already linked to a different account. Resolve the ownership mapping before confirming.')
-                c.execute('INSERT INTO email_account_links(issuer,account_type,last4,account_id) VALUES(?,?,?,?) ON CONFLICT(issuer,account_type,last4) DO UPDATE SET account_id=excluded.account_id',(p['issuer'],p['account_type'],p['account_last4'],account_id))
+                if p.get('account_last4'):
+                    c.execute('INSERT INTO email_account_links(issuer,account_type,last4,account_id) VALUES(?,?,?,?) ON CONFLICT(issuer,account_type,last4) DO UPDATE SET account_id=excluded.account_id',(p['issuer'],p['account_type'],p['account_last4'],account_id))
                 status='review' if matches else ('excluded' if kind in ('transfer','repayment') else 'active')
                 marker=hashlib.sha256((item['mailbox']+'|'+item['message_id']).encode()).hexdigest()[:24]
                 batch=c.execute('INSERT INTO imports(filename,account_id,created_at) VALUES(?,?,?)',('email-alert-'+marker,account_id,datetime.now().isoformat())).lastrowid
+                transaction_timing.save(c,batch,p)
                 description=description.strip()
                 fingerprint=ledger.raw_hash(p['date'],p['amount'],description,account['name'])
                 tx_id=c.execute("""INSERT INTO transactions(date,description,amount,account_id,category_id,status,source_file,raw_hash,source_hash,import_id,kind,previous_status,source_type,duplicate_of)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(p['date'],description,p['amount'],account_id,category_id,status,'Email alert · '+p['parser_id'],fingerprint,fingerprint,batch,kind,'excluded' if kind in ('transfer','repayment') else 'active','email',matches[0]['id'] if matches else None)).lastrowid
                 original=dict(date=p['date'],amount=p['amount'],description=p['description'],category_id=p['category_id'],kind=p['kind'],status='active')
                 c.execute('UPDATE transactions SET email_original=? WHERE id=?',(json.dumps(original),tx_id))
-                c.execute("UPDATE gmail_intake SET status='imported',import_id=?,note=?,preview_options=NULL WHERE id=?",(batch,'Email transaction saved as provisional. Account ending confirmed for future automatic sync.',item_id))
+                note='Email transaction saved as provisional. '+('Account ending confirmed for future automatic sync.' if p.get('account_last4') else 'Destination confirmed for this email only; no account number was supplied.')
+                c.execute("UPDATE gmail_intake SET status='imported',import_id=?,note=?,preview_options=NULL WHERE id=?",(batch,note,item_id))
             return {'transaction_id':tx_id,'import_id':batch,'review':bool(matches),'account':account['name'],'provisional':True}
         finally: operation_lock.release()
 

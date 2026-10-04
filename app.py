@@ -13,8 +13,10 @@ import secrets
 import credential_store
 import gmail_ingestion
 import custom_parsers
+import salary_cycles
+import period_reports
 import sys
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -26,7 +28,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 
 ROOT = Path(__file__).parent
 DB = ROOT / "finance.db"
@@ -41,7 +43,7 @@ async def local_browser_guard(request: Request, call_next):
     if (request.headers.get('sec-fetch-site') == 'cross-site' or
             (origin and origin != str(request.base_url).rstrip('/'))):
         return JSONResponse({'detail': 'Cross-site access is not allowed.'}, status_code=403)
-    if '/statement-password' in request.url.path or request.url.path.startswith(('/api/gmail/','/api/developer/')):
+    if '/statement-password' in request.url.path or request.url.path.startswith(('/api/gmail/','/api/developer/','/api/salary-cycles')):
         if not secrets.compare_digest(request.headers.get('x-ledger-token', ''), LOCAL_TOKEN):
             return JSONResponse({'detail': 'Refresh Ledger before managing passwords.'}, status_code=403)
     response = await call_next(request)
@@ -83,8 +85,11 @@ def init_db():
         c.executescript(SCHEMA)
         gmail_ingestion.init_schema(c)
         custom_parsers.init_schema(c)
+        salary_cycles.init_schema(c)
         c.execute('CREATE TABLE IF NOT EXISTS removed_categories (name TEXT PRIMARY KEY COLLATE NOCASE)')
         c.execute('CREATE TABLE IF NOT EXISTS badges (id INTEGER PRIMARY KEY, name TEXT UNIQUE COLLATE NOCASE NOT NULL, keywords TEXT NOT NULL, whole_word INTEGER NOT NULL DEFAULT 0)')
+        if 'badge_overrides' not in {r['name'] for r in c.execute('PRAGMA table_info(transactions)')}:
+            c.execute("ALTER TABLE transactions ADD COLUMN badge_overrides TEXT NOT NULL DEFAULT '{}'")
         c.execute('CREATE TABLE IF NOT EXISTS preferences_migrations (name TEXT PRIMARY KEY)')
         if not c.execute("SELECT 1 FROM preferences_migrations WHERE name='badges-v1'").fetchone():
             for name, keywords in [('UPI',['UPI']),('EMI',['EMI','EASYEMI','SMARTEMI']),('NEFT',['NEFT']),('IMPS',['IMPS']),('Auto-pay',['AUTOPAY','NACH'])]:
@@ -92,7 +97,7 @@ def init_db():
             c.execute("INSERT INTO preferences_migrations VALUES('badges-v1')")
         c.execute('CREATE TABLE IF NOT EXISTS statement_credentials (account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, credential_key TEXT UNIQUE NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS card_identities (issuer TEXT NOT NULL, last4 TEXT NOT NULL, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, PRIMARY KEY(issuer,last4))')
-        for name in DEFAULT_CATEGORIES + ['Online food order','Quick commerce','Investments']:
+        for name in DEFAULT_CATEGORIES + ['Online food order','Quick commerce','Investments','Subscriptions']:
             if not c.execute('SELECT 1 FROM removed_categories WHERE name=?',(name,)).fetchone():
                 c.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (name,))
         old_people=c.execute("SELECT id FROM categories WHERE name='Money to/from people'").fetchone()
@@ -108,6 +113,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, transaction_id INTEGER, before_json TEXT, changed_at TEXT);
             CREATE TABLE IF NOT EXISTS account_aliases (name TEXT PRIMARY KEY, account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE);""")
         additions = {'import_id':'INTEGER', 'source_hash':'TEXT', 'previous_status':'TEXT', 'kind':"TEXT DEFAULT 'other'", 'transfer_link':'TEXT', 'source_type':"TEXT NOT NULL DEFAULT 'statement'", 'duplicate_of':'INTEGER', 'email_original':'TEXT'}
+        additions.update(statement_time='TEXT',statement_time_date='TEXT')
         c.execute('''CREATE TABLE IF NOT EXISTS reconciliations (id INTEGER PRIMARY KEY, transaction_id INTEGER NOT NULL REFERENCES transactions(id), statement_import_id INTEGER NOT NULL REFERENCES imports(id), before_json TEXT NOT NULL, after_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)''')
         reconciliation_columns={r['name'] for r in c.execute('PRAGMA table_info(reconciliations)')}
         for field in ('statement_json','statement_hash'):
@@ -158,16 +164,19 @@ def startup():
         folder=ROOT/'backups'; folder.mkdir(exist_ok=True)
         target=folder/('daily-'+date.today().isoformat()+'.db')
         if not target.exists():
-            with sqlite3.connect(DB) as source, sqlite3.connect(target) as destination: source.backup(destination)
+            backup_database(target)
     init_db()
 
 def rows(query, args=()):
     with conn() as c: return [dict(r) for r in c.execute(query, args).fetchall()]
 
 def tx_rows(where="1=1", args=()):
-    return rows(f"""SELECT t.*, a.name account_name, a.type account_type, COALESCE(c.name,'Uncategorized') category
+    result=rows(f"""SELECT t.*, a.name account_name, a.type account_type, COALESCE(c.name,'Uncategorized') category
         FROM transactions t JOIN accounts a ON a.id=t.account_id LEFT JOIN categories c ON c.id=t.category_id
         WHERE {where} ORDER BY t.date DESC, t.id DESC""", args)
+    for t in result:t['badge_overrides']=json.loads(t['badge_overrides'])
+    with conn() as c:
+        return gmail_ingestion.transaction_timing.annotate(result,c)
 
 def raw_hash(day, amount, description, account):
     value = f"{day}|{float(amount):.2f}|{description.strip().lower()}|{account.strip().lower()}"
@@ -198,6 +207,10 @@ def automatic_statement_account(database, filename, extension, contents, passwor
         import pdfplumber
         with pdfplumber.open(io.BytesIO(contents), password=password) as document:
             text = document.pages[0].extract_text() or ''
+        from parsers import idfc_statement
+        if idfc_statement.matches(text):
+            suffix=idfc_statement.account_number(text)[-4:]
+            return database.execute("SELECT a.* FROM email_account_links l JOIN accounts a ON a.id=l.account_id WHERE l.issuer='idfc' AND l.account_type='bank' AND l.last4=? AND a.type='bank' AND a.archived=0",(suffix,)).fetchone()
         if 'GSTIN of SBI Card' in text:
             # Layout identifies the issuer, not a particular card. Email filenames
             # commonly contain document IDs; never replace a chosen account with
@@ -261,6 +274,7 @@ class TransactionUpdate(BaseModel):
     status: str = "active"
     create_rule: bool = False
     kind: Optional[str] = None
+    badge_overrides: Optional[dict[int,StrictBool]] = None
 
 @app.get("/")
 def index():
@@ -271,7 +285,7 @@ def index():
     html=html.replace('</head>', f'<meta name="ledger-token" content="{LOCAL_TOKEN}"></head>')
     gmail_version=hashlib.sha256((ROOT/'static'/'gmail.js').read_bytes()).hexdigest()[:12]
     html=html.replace('</body>',f'<script src="/static/gmail.js?v={gmail_version}"></script></body>')
-    for asset in ('workspace.css','workspace.js','balances.js'):
+    for asset in ('workspace.css','workspace.js','balances.js','period.js','polish.css','polish.js','period.css'):
         stamp=hashlib.sha256((ROOT/'static'/asset).read_bytes()).hexdigest()[:12]
         tag=f'<link rel="stylesheet" href="/static/{asset}?v={stamp}">' if asset.endswith('.css') else f'<script src="/static/{asset}?v={stamp}"></script>'
         html=html.replace('</head>' if asset.endswith('.css') else '</body>',tag+('</head>' if asset.endswith('.css') else '</body>'))
@@ -279,7 +293,11 @@ def index():
 
 @app.get("/api/bootstrap")
 def bootstrap():
-    return {"accounts": rows("SELECT * FROM accounts ORDER BY name"), "categories": rows("SELECT * FROM categories ORDER BY name"), "transactions": tx_rows("t.status IN ('active','excluded')"), "trash": tx_rows("t.status = 'deleted'"), "review": tx_rows("t.status = 'review'")}
+    transactions = tx_rows()
+    return {"accounts": rows("SELECT * FROM accounts ORDER BY name"), "categories": rows("SELECT * FROM categories ORDER BY name"),
+            "transactions": [t for t in transactions if t['status'] in ('active','excluded')],
+            "trash": [t for t in transactions if t['status']=='deleted'],
+            "review": [t for t in transactions if t['status']=='review']}
 
 @app.post("/api/accounts")
 def create_account(name: str = Form(...), type: str = Form(...), currency: str = Form("INR")):
@@ -366,6 +384,8 @@ def reconcile_email(c,email,statement,batch_id):
         baseline['description']=email['description']
     changes={field:(statement[field] if field in baseline and email[field]==baseline[field] else email[field]) for field in ('date','amount','description','category_id','kind','status')}
     if changes['kind'] in ('transfer','repayment'): changes['status']='excluded'
+    if statement.get('statement_time'):
+        changes.update(statement_time=statement['statement_time'],statement_time_date=statement['date'])
     audit_transaction(c,email['id'])
     account=c.execute('SELECT name FROM accounts WHERE id=?',(email['account_id'],)).fetchone()
     changes.update(source_type='statement',source_file=statement['source_file'],raw_hash=raw_hash(changes['date'],changes['amount'],changes['description'],account['name']))
@@ -400,6 +420,7 @@ async def import_csv(account_id: int = Form(...), file: UploadFile = File(...), 
     dcol, xcol, acol = field("date", "transaction date", "txn date"), field("description", "narration", "merchant", "particulars"), field("amount", "transaction amount", "debit")
     if not all((dcol, xcol, acol)): raise HTTPException(400, "Use headers Date, Description, Amount (or Transaction Date/Narration).")
     created = review = skipped = reconciled = 0
+    timecol=field('time','transaction time','txn time')
     statement_keys=[]
     for source_row in reader:
         try: statement_keys.append((parse_date(source_row[dcol]),parse_amount(source_row[acol])))
@@ -420,6 +441,7 @@ async def import_csv(account_id: int = Form(...), file: UploadFile = File(...), 
                 if not description: raise ValueError('Missing description')
             except (ValueError, TypeError, AttributeError): skipped += 1; continue
             h = raw_hash(day, amount, description, account["name"])
+            clock=gmail_ingestion.transaction_timing.statement_clock(item.get(timecol) if timecol else item[dcol],numeric=bool(timecol))
             nearby=c.execute("SELECT * FROM transactions WHERE account_id=? AND status!='deleted' AND abs(amount-?)<0.005 AND date=? ORDER BY id",(account['id'],amount,day)).fetchall()
             emails=[t for t in nearby if t['source_type']=='email']
             overlap=emails[0] if emails else None
@@ -432,24 +454,26 @@ async def import_csv(account_id: int = Form(...), file: UploadFile = File(...), 
             category_id = card_payment_category if is_card_payment(description) else categorise(description, c)
             if kind == 'repayment': category_id = card_payment_category
             if kind == 'refund' and category_id == c.execute("SELECT id FROM categories WHERE name='Uncategorized'").fetchone()[0]: category_id = c.execute("SELECT id FROM categories WHERE name='Refund / Cashback'").fetchone()[0]
-            parsed.append(dict(date=day,description=description,amount=amount,kind=kind,duplicate=bool(duplicate),hash=h,reconciled=bool(promote)))
+            parsed.append(dict(date=day,description=description,amount=amount,kind=kind,duplicate=bool(duplicate),hash=h,reconciled=bool(promote),statement_time=clock))
             if promote:
-                if not preview: reconcile_email(c,promote,dict(date=day,amount=amount,description=description,category_id=category_id,kind=kind,status=status,source_file=filename),batch)
+                if not preview: reconcile_email(c,promote,dict(date=day,amount=amount,description=description,category_id=category_id,kind=kind,status=status,source_file=filename,statement_time=clock),batch)
                 reconciled+=1
                 continue
             if not preview:
                 inserted=c.execute("INSERT INTO transactions(date,description,amount,account_id,category_id,status,source_file,raw_hash,source_hash,import_id,kind,previous_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (day,description,amount,account['id'],category_id,status,filename,h,h,batch,kind,'excluded' if kind in ('transfer','repayment') else 'active')).lastrowid
                 if overlap: c.execute('UPDATE transactions SET duplicate_of=? WHERE id=?',(overlap['id'],inserted))
+                if clock: c.execute('UPDATE transactions SET statement_time=?,statement_time_date=? WHERE id=?',(clock,day,inserted))
             review += bool(duplicate); created += not bool(duplicate)
         if not parsed: raise HTTPException(400,'No valid transactions found; nothing imported.')
         if preview: c.rollback()
     return {"created": created, "review": review, "skipped": skipped, "reconciled":reconciled,"account": account["name"], 'detected': bool(detected_account), 'import_id':batch, 'rows':parsed, 'debits':round(-sum(r['amount'] for r in parsed if r['amount']<0),2), 'credits':round(sum(r['amount'] for r in parsed if r['amount']>0),2)}
 
 def parse_date(value):
+    if isinstance(value, datetime): return value.date().isoformat()
     if isinstance(value, (int, float)):
         # Excel's 1900-based serial dates (including the historic leap-year quirk).
         return (date(1899, 12, 30) + timedelta(days=value)).isoformat()
-    value = value.strip().split(" / ")[0]
+    value = re.split(r'(?:\s*[/|T]\s*|\s+)\d{1,2}:\d{2}',value.strip(),maxsplit=1)[0].strip()
     for f in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%m/%d/%Y", "%d %b %Y", "%d %b %y", "%d-%b-%Y"):
         try: return datetime.strptime(value, f).date().isoformat()
         except ValueError: pass
@@ -472,6 +496,9 @@ def read_statement(contents: bytes, extension: str, filename: str = "", password
         import pdfplumber
         with pdfplumber.open(io.BytesIO(contents), password=password) as document:
             first_page = document.pages[0].extract_text() or ''
+            from parsers import idfc_statement
+            if idfc_statement.matches(first_page):
+                return idfc_statement.parse_document(document)
             from parsers import hdfc_statement
             if hdfc_statement.matches(first_page):
                 return hdfc_statement.parse_pages([first_page]+[p.extract_text() or '' for p in document.pages[1:]])
@@ -563,6 +590,12 @@ def normalise_excel_statement(matrix):
     def value(row, name):
         index = lookup.get(name.lower())
         return row[index] if index is not None and index < len(row) else ""
+    def clock(row,day):
+        for name in ('time','transaction time','txn time'):
+            supplied=value(row,name)
+            if supplied not in (None,''):
+                return gmail_ingestion.transaction_timing.statement_clock(supplied,numeric=True)
+        return gmail_ingestion.transaction_timing.statement_clock(day)
     is_hdfc = "narration" in lookup and "withdrawal amt." in lookup
     is_idfc = "particulars" in lookup and "transaction date" in lookup
     is_credit_card = {"date & time", "description", "amt", "debit / credit"}.issubset(lookup)
@@ -577,7 +610,7 @@ def normalise_excel_statement(matrix):
                 signed_amount = abs(parse_amount(amount)) if str(direction).strip().lower() == "cr" else -abs(parse_amount(amount))
             except (ValueError, TypeError, AttributeError):
                 continue
-            result.append({"Date": day, "Description": description, "Amount": signed_amount})
+            result.append({"Date": day, "Description": description, "Amount": signed_amount,"Time":clock(row,day)})
             continue
         if is_hdfc:
             day, description = value(row, "date"), value(row, "narration")
@@ -588,7 +621,7 @@ def normalise_excel_statement(matrix):
         else:
             day, description, amount = value(row, "date") or value(row, "transaction date"), value(row, "description") or value(row, "narration") or value(row, "particulars"), value(row, "amount") or value(row, "transaction amount")
             if day and description and amount not in (None, ""):
-                result.append({"Date": day, "Description": description, "Amount": amount})
+                result.append({"Date": day, "Description": description, "Amount": amount,"Time":clock(row,day)})
             continue
         if not day or not description or str(day).startswith("*"): continue
         try:
@@ -598,7 +631,7 @@ def normalise_excel_statement(matrix):
         debit_value = abs(parse_amount(debit)) if str(debit or '').strip() else 0
         credit_value = abs(parse_amount(credit)) if str(credit or '').strip() else 0
         if debit_value and credit_value: raise ValueError('A row has both debit and credit amounts; please check the statement.')
-        result.append({"Date": day, "Description": description, "Amount": round(credit_value-debit_value,2)})
+        result.append({"Date": day, "Description": description, "Amount": round(credit_value-debit_value,2),"Time":clock(row,day)})
     return result
 
 def find_statement_header(matrix):
@@ -641,6 +674,8 @@ def update_transaction(tx_id: int, item: TransactionUpdate):
         account = c.execute('SELECT * FROM accounts WHERE id=?',(item.account_id,)).fetchone()
         category = c.execute('SELECT name FROM categories WHERE id=?',(item.category_id,)).fetchone()
         if not account or (item.category_id is not None and not category): raise HTTPException(400,'Choose an existing account and category.')
+        if item.badge_overrides is not None:
+            validate_badge_ids(c,item.badge_overrides)
         try: day = date.fromisoformat(item.date).isoformat()
         except ValueError: raise HTTPException(400,'Enter a valid date.')
         if not item.description.strip() or not math.isfinite(item.amount): raise HTTPException(400,'Enter a description and valid amount.')
@@ -655,6 +690,8 @@ def update_transaction(tx_id: int, item: TransactionUpdate):
         c.execute("UPDATE transactions SET date=?,description=?,amount=?,account_id=?,category_id=?,status=?,edited_at=?,raw_hash=?,kind=? WHERE id=?", (day,item.description.strip(),round(item.amount,2),item.account_id,item.category_id,status,datetime.now().isoformat(timespec='seconds'),raw_hash(day,item.amount,item.description,account['name']),kind,tx_id))
         if item.create_rule and item.category_id:
             c.execute("INSERT INTO rules(merchant_pattern,category_id) VALUES(?,?) ON CONFLICT(merchant_pattern) DO UPDATE SET category_id=excluded.category_id", (item.description.strip(),item.category_id))
+        if item.badge_overrides is not None:
+            c.execute('UPDATE transactions SET badge_overrides=? WHERE id=?',(json.dumps(item.badge_overrides),tx_id))
     return {"ok": True}
 
 @app.post("/api/transactions/{tx_id}/delete")
@@ -827,8 +864,11 @@ def undo_import(batch_id:int):
             raise HTTPException(409,'Undo the statement reconciliation import before undoing its original email import.')
         for r in c.execute('SELECT * FROM reconciliations WHERE statement_import_id=? AND active=1',(batch_id,)).fetchall():
             current=dict(c.execute('SELECT * FROM transactions WHERE id=?',(r['transaction_id'],)).fetchone())
-            if current!=json.loads(r['after_json']): raise HTTPException(409,'A reconciled transaction was edited afterward. Undo stopped to preserve those edits.')
+            after=json.loads(r['after_json']);after.setdefault('badge_overrides','{}')
+            for field in ('statement_time','statement_time_date'): after.setdefault(field,None)
+            if current!=after: raise HTTPException(409,'A reconciled transaction was edited afterward. Undo stopped to preserve those edits.')
             before=json.loads(r['before_json']);audit_transaction(c,r['transaction_id'])
+            for field in ('statement_time','statement_time_date'): before.setdefault(field,None)
             fields=[k for k in before if k!='id']
             c.execute('UPDATE transactions SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',tuple(before[k] for k in fields)+(r['transaction_id'],))
             c.execute('UPDATE reconciliations SET active=0 WHERE id=?',(r['id'],))
@@ -881,9 +921,14 @@ def export_transactions():
 @app.get('/api/backup')
 def download_backup():
     folder=ROOT/'backups'; folder.mkdir(exist_ok=True)
-    target=folder/('ledger-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'.db')
-    with sqlite3.connect(DB) as source, sqlite3.connect(target) as destination: source.backup(destination)
+    target=folder/('ledger-'+datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.db')
+    backup_database(target)
     return FileResponse(target,filename=target.name,media_type='application/octet-stream')
+
+def backup_database(target):
+    # sqlite's context manager commits/rolls back; it does not close handles.
+    with closing(sqlite3.connect(DB)) as source, closing(sqlite3.connect(target)) as destination:
+        source.backup(destination)
 
 @app.get('/api/rules')
 def list_rules():
@@ -941,18 +986,55 @@ def list_badges():
     return [dict(**b,patterns=json.loads(b['keywords'])) for b in rows('SELECT * FROM badges ORDER BY name')]
 
 @app.post('/api/badges')
-def save_badge(name: str = Form(...), keywords: str = Form(...), whole_word: bool = Form(False)):
+def save_badge(name: str = Form(...), keywords: str = Form(''), whole_word: bool = Form(False)):
     name=name.strip(); patterns=list(dict.fromkeys(k.strip().lower() for k in keywords.split(',') if k.strip()))
-    if not name or len(name)>40 or not patterns or len(patterns)>20 or any(len(p)>100 for p in patterns):
-        raise HTTPException(400,'Use a name up to 40 characters and 1–20 comma-separated keywords, up to 100 characters each.')
+    if not name or len(name)>40 or (keywords.strip() and not patterns) or len(patterns)>20 or any(len(p)>100 for p in patterns):
+        raise HTTPException(400,'Use a name up to 40 characters and up to 20 optional comma-separated keywords, up to 100 characters each.')
     with conn() as c:
         c.execute('INSERT INTO badges(name,keywords,whole_word) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET keywords=excluded.keywords,whole_word=excluded.whole_word',(name,json.dumps(patterns),int(whole_word)))
     return {'ok':True}
 
 @app.delete('/api/badges/{badge_id}')
 def remove_badge(badge_id: int):
-    with conn() as c: c.execute('DELETE FROM badges WHERE id=?',(badge_id,))
+    with conn() as c:
+        for t in c.execute("SELECT id,badge_overrides FROM transactions WHERE badge_overrides!='{}'").fetchall():
+            overrides=json.loads(t['badge_overrides'])
+            if str(badge_id) in overrides:
+                del overrides[str(badge_id)]
+                c.execute('UPDATE transactions SET badge_overrides=? WHERE id=?',(json.dumps(overrides),t['id']))
+        c.execute('DELETE FROM badges WHERE id=?',(badge_id,))
     return {'ok':True}
+
+def validate_badge_ids(c,ids):
+    existing={r['id'] for r in c.execute('SELECT id FROM badges')}
+    if not set(ids)<=existing:raise HTTPException(400,'A badge no longer exists. Refresh and try again.')
+
+class BulkBadges(BaseModel):
+    transaction_ids:list[int]
+    badge_ids:list[int]
+    action:str
+
+@app.post('/api/transaction-badges/bulk')
+def bulk_badges(item:BulkBadges):
+    ids=set(item.transaction_ids);badges=set(item.badge_ids)
+    if not ids or len(ids)>5000 or not badges or item.action not in ('add','remove','auto'):
+        raise HTTPException(400,'Select 1–5000 transactions, at least one badge, and a valid action.')
+    with conn() as c:
+        validate_badge_ids(c,badges)
+        records=[]
+        for tx_id in ids:
+            t=c.execute('SELECT id,status,badge_overrides FROM transactions WHERE id=?',(tx_id,)).fetchone()
+            if not t or t['status'] not in ('active','excluded'):
+                raise HTTPException(400,'Only current transactions can be updated. Refresh and try again.')
+            records.append(t)
+        for t in records:
+            overrides=json.loads(t['badge_overrides'])
+            for badge in badges:
+                if item.action=='auto':overrides.pop(str(badge),None)
+                else:overrides[str(badge)]=item.action=='add'
+            audit_transaction(c,t['id'])
+            c.execute('UPDATE transactions SET badge_overrides=? WHERE id=?',(json.dumps(overrides),t['id']))
+    return {'updated':len(records)}
 
 @app.get('/api/coverage')
 def coverage():
@@ -961,3 +1043,5 @@ def coverage():
 
 app.include_router(gmail_ingestion.bind(sys.modules[__name__]))
 app.include_router(custom_parsers.bind(sys.modules[__name__]))
+app.include_router(salary_cycles.bind(sys.modules[__name__]))
+app.include_router(period_reports.bind(sys.modules[__name__]))

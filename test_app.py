@@ -87,6 +87,16 @@ class LedgerTests(unittest.TestCase):
         self.upload('Date,Description,Amount\n2026-08-02,FOOD SHOP city,-200\n')
         self.assertEqual(app.bootstrap()['transactions'][0]['category'],'Shopping')
 
+    def test_new_category_rule_preserves_existing_rules(self):
+        cats={c['name']:c['id'] for c in app.bootstrap()['categories']}
+        before=self.client.get('/api/rules').json()
+        result=self.client.post('/api/rules',data={'pattern':'unique test merchant','category_id':cats['Shopping']})
+        self.assertEqual(result.status_code,200,result.text)
+        after=self.client.get('/api/rules').json()
+        self.assertEqual(len(after),len(before)+1)
+        self.assertTrue(all(r in after for r in before))
+        self.assertEqual(next(r for r in after if r['merchant_pattern']=='unique test merchant')['category_id'],cats['Shopping'])
+
     def test_zero_debit_credit(self):
         result=app.normalise_excel_statement([['Transaction Date','Particulars','Debit','Credit'],['01/08/2026','Salary',0,20000]])
         self.assertEqual(result[0]['Amount'],20000)

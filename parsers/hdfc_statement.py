@@ -28,7 +28,7 @@ def parse_pages(pages):
             day,clock,description,credit,amount=match.groups()
             stamp=datetime.strptime(day+' '+clock,'%d/%m/%Y %H:%M')
             value=Decimal(amount.replace(',',''))
-            rows.append({'Date':stamp.date().isoformat(),'Description':description,'Amount':float(value if credit else -value)})
+            rows.append({'Date':stamp.date().isoformat(),'Time':stamp.strftime('%H:%M:%S'),'Description':description,'Amount':float(value if credit else -value)})
     if not rows:
         raise ValueError('No supported HDFC credit-card transaction table was found in this PDF.')
     return rows
